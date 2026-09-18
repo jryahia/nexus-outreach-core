@@ -119,7 +119,7 @@ def parse_accounts(raw: str, default_from_name: str = "") -> list[SenderAccount]
     The email is split on the FIRST colon only - an app password containing a
     colon survives intact. An optional display name goes after a pipe:
 
-        a@x.com:pass1|Yahya Jarray
+        a@x.com:pass1|Display Name
 
     The pipe is used rather than a third colon because a colon inside the
     password would make a third field ambiguous.

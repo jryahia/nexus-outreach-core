@@ -215,7 +215,7 @@ def pick_batch(stage: str, key: str) -> str | None:
     return labels[chosen]
 
 
-# The CRM view. Order is the reading order Yahya asked for - who they are
+# The CRM view. Order is the intended reading order - who they are
 # first, how to reach them second, provenance last.
 LEAD_COLUMNS = {
     "name": "Name",

@@ -60,7 +60,7 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt   # Windows
 # source .venv/bin/activate && pip install -r requirements.txt  # macOS / Linux
 
-.venv\Scripts\python.exe -m scrapling install                  # browser binaries
+.venv\Scripts\scrapling.exe install                            # browser binaries
 ```
 
 Copy the example config and fill it in:

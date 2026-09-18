@@ -66,8 +66,8 @@ colon = parse_accounts("a@x.com:pa:ss:1")
 check("password keeps its colons", colon[0].app_password == "pa:ss:1",
       colon[0].app_password)
 
-named = parse_accounts("a@x.com:pass1|Yahya Jarray", "Fallback")
-check("pipe sets the display name", named[0].from_name == "Yahya Jarray")
+named = parse_accounts("a@x.com:pass1|Display Name", "Fallback")
+check("pipe sets the display name", named[0].from_name == "Display Name")
 check("default name applied", parse_accounts("a@x.com:p", "Fallback")[0].from_name
       == "Fallback")
 check("empty value yields nothing", parse_accounts("") == [])
@@ -88,16 +88,16 @@ check("placeholders substituted",
       "Tone Films" in out and "tonefilms.com" in out and "New York" in out, out)
 check("unknown placeholder left alone", "[nope]" in cannon.render("[nope]", lead))
 
-sender = SenderAccount("me@mydomain.com", "x", "Yahya")
+sender = SenderAccount("me@mydomain.com", "x", "Sender")
 cfg = AppConfig(
-    smtp=SmtpConfig(email=sender.email, app_password="x", from_name="Yahya",
+    smtp=SmtpConfig(email=sender.email, app_password="x", from_name="Sender",
                     reply_to="reply@mydomain.com"),
     senders=[sender],
     unsubscribe_line="Reply STOP and I will not contact you again.",
 )
 msg = cannon.build_message(cfg, sender, lead, "Idea for [name]", "{Hi|Hello} [name],",
                            random.Random(5))
-check("From header formatted", msg["From"] == "Yahya <me@mydomain.com>", msg["From"])
+check("From header formatted", msg["From"] == "Sender <me@mydomain.com>", msg["From"])
 check("To is the lead", msg["To"] == "sam@tonefilms.com")
 check("subject merged", msg["Subject"] == "Idea for Tone Films", msg["Subject"])
 check("reply-to set", msg["Reply-To"] == "reply@mydomain.com")
@@ -157,7 +157,7 @@ def make_leads(count: int) -> list[dict]:
 print("\nround-robin rotation, 3 mailboxes x 7 leads")
 senders = [SenderAccount(f"box{i}@mydomain.com", "pw", f"Sender {i}") for i in (1, 2, 3)]
 rot_cfg = AppConfig(
-    smtp=SmtpConfig(email=senders[0].email, app_password="pw", from_name="Yahya"),
+    smtp=SmtpConfig(email=senders[0].email, app_password="pw", from_name="Sender"),
     senders=senders, daily_cap=0, coffee_every=0,
 )
 rot_job = Job(key="rotation")
