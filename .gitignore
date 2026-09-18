@@ -1,0 +1,27 @@
+# Credentials - never commit
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Scraped leads, campaign history and the local database
+data/
+*.csv
+
+# Browser profiles captured by tools/tiktok_login.py
+profiles/
+*.session
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

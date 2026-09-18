@@ -1,0 +1,18 @@
+# Dark mode by default - set at the framework level, not via CSS injection.
+# These four must track ui/theme.py: the slider, toggle, segmented control and
+# focus rings are painted by Streamlit itself from primaryColor, so leaving it
+# on the old blue puts stock-blue widgets in the middle of a cyan surface.
+[theme]
+base = "dark"
+primaryColor = "#00F3FF"
+backgroundColor = "#020205"
+secondaryBackgroundColor = "#0A1119"
+textColor = "#D8F6FF"
+
+[server]
+headless = true
+runOnSave = true
+fileWatcherType = "auto"
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,26 @@
+# tools-clipagent - resolved and dry-run verified against CPython 3.14.4 / Windows 11
+# Every pin below has a prebuilt win_amd64 or py3-none wheel. No MSVC build step.
+
+# --- Scraping engine -------------------------------------------------------
+# [fetchers] extra adds curl_cffi (TLS fingerprint impersonation),
+# playwright + patchright (patched Chromium driver) and browserforge
+# (fingerprint generation). This is what powers StealthyFetcher / DynamicFetcher.
+scrapling[fetchers]==0.4.15
+
+# --- UI --------------------------------------------------------------------
+streamlit==1.64.0
+pandas==2.3.3
+plotly==7.1.0
+# Force-directed network graph (vis.js) and the 3D radar map.
+# pydeck ships with streamlit; pinned here because the map depends on it.
+streamlit-agraph==0.0.45
+pydeck==0.9.3
+
+# --- Data / config ---------------------------------------------------------
+python-dotenv==1.2.1
+email-validator==2.3.0
+
+# NOTE: after pip install you MUST run the browser bootstrap once:
+#   scrapling install
+# It downloads the patched Chromium build and the fingerprint datapoints.
+# pip alone is not enough - StealthyFetcher will raise at runtime without it.
