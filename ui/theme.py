@@ -786,6 +786,28 @@ _CSS = f"""
   /* The state marker itself is data, not decoration. */
   .nx-state {{ display: none; }}
 
+  /* ---- Lock-on: a zone is acquired on the radar -------------------------- */
+  /* Amber rather than the firing green: a zone is a selection, not a send.
+     The corners blink; nothing else on the page moves, so the blink reads as
+     an alert instead of noise. */
+  .nx-lock .nx-visor .corner::before {{
+      border-color: {WARNING};
+      box-shadow: 0 0 18px rgba(255, 170, 0, 0.6);
+      animation: nx-lockblink 1.1s steps(1, end) infinite;
+  }}
+  .nx-lock .nx-visor .readout {{
+      color: {WARNING};
+      text-shadow: 0 0 10px rgba(255, 170, 0, 0.6);
+  }}
+  .nx-lock .nx-visor .tl .readout {{
+      animation: nx-lockblink 1.1s steps(1, end) infinite;
+  }}
+  .nx-lock .nx-visor .rail {{ color: {WARNING}; }}
+  @keyframes nx-lockblink {{
+      0%, 59%   {{ opacity: 1; }}
+      60%, 100% {{ opacity: 0.32; }}
+  }}
+
   /* ---- Mouse-tracking spotlight ----------------------------------------- */
   /* --mouse-x / --mouse-y are written to the document root once per animation
      frame by the runtime controller, never on the mousemove event itself:
@@ -962,6 +984,8 @@ _CSS = f"""
       .stButton > button[kind="primary"],
       [data-testid="stBaseButton-primary"],
       .nx-badge, .nx-badge .beacon, .nx-log::after,
+      .nx-lock .nx-visor .corner::before,
+      .nx-lock .nx-visor .tl .readout,
       .nx-rings::before, .nx-rings::after,
       .nx-hero:hover, .nx-section:hover,
       .stButton > button:hover, .stDownloadButton > button:hover,
@@ -1265,6 +1289,7 @@ _HUD_JS = r"""
   // backend, no guessing, and it self-clears when the fragment stops drawing.
   var active = false;
   var spin = 1;          // eased rotation multiplier, so speed changes glide
+  var zoneCount = -1;    // -1 = no zone; 0+ = that many targets locked
 
   function readState() {
     var marker = D.querySelector('.nx-state[data-state="running"]');
@@ -1272,6 +1297,18 @@ _HUD_JS = r"""
     if (now !== active) {
       active = now;
       root.classList.toggle('nx-active', active);
+    }
+
+    // The count is read off the marker's dataset rather than counted in JS:
+    // Python already knows how many leads fell inside the zone, and two
+    // independent tallies would eventually disagree.
+    var zone = D.querySelector('.nx-zone-state[data-count]');
+    var next = zone ? parseInt(zone.dataset.count, 10) : -1;
+    if (isNaN(next)) { next = -1; }
+    if (next !== zoneCount) {
+      zoneCount = next;
+      root.classList.toggle('nx-lock', zoneCount >= 0);
+      fpsLast = 0;   // force the readouts to repaint on the next frame
     }
   }
 
@@ -1394,10 +1431,12 @@ _HUD_JS = r"""
       fpsLast = t;
 
       if (readouts.tl) {
-        readouts.tl.textContent =
-          'SYS.OP  ' + (active ? 'FIRING' : 'NORMAL') +
-          '\nRENDER  ' + (core ? 'WEBGL' : '2D') +
-          '\nFRAME   ' + fpsValue + ' FPS';
+        readouts.tl.textContent = zoneCount >= 0
+          ? 'ZONE ACQUIRED\n' + zoneCount + ' TARGETS LOCKED\nFRAME   ' +
+            fpsValue + ' FPS'
+          : 'SYS.OP  ' + (active ? 'FIRING' : 'NORMAL') +
+            '\nRENDER  ' + (core ? 'WEBGL' : '2D') +
+            '\nFRAME   ' + fpsValue + ' FPS';
       }
       if (readouts.tr) {
         var mem = 'N/A';
@@ -1580,6 +1619,7 @@ _HUD_JS = r"""
     P.removeEventListener('resize', onCanvasResize);
     disposeCore();
     root.classList.remove('nx-active');
+    root.classList.remove('nx-lock');
     if (visor && visor.parentNode) { visor.remove(); }
     visor = null;
     if (canvas && canvas.parentNode) { canvas.remove(); }
@@ -1674,6 +1714,20 @@ def system_state(running: bool) -> None:
     """
     st.markdown(
         f'<div class="nx-state" data-state="{"running" if running else "idle"}"></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def zone_state(count: int | None) -> None:
+    """Publish the acquired-zone size for the runtime HUD.
+
+    ``None`` means no zone. Rendered wherever the radar is drawn, so it
+    disappears with the tab and the HUD falls back to its normal readout.
+    """
+    if count is None:
+        return
+    st.markdown(
+        f'<div class="nx-zone-state" data-count="{int(count)}"></div>',
         unsafe_allow_html=True,
     )
 

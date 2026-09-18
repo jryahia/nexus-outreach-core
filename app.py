@@ -34,6 +34,7 @@ from ui.theme import (
     hud_runtime,
     status_badge,
     system_state,
+    zone_state,
     apply_theme,
     check_row,
     header,
@@ -732,6 +733,24 @@ def lead_intelligence() -> None:
         source="" if chosen_source == ALL else chosen_source,
         text=text.strip(),
     )
+
+    # A zone acquired on the radar narrows this grid too, so the CRM and the
+    # map are never showing two different lists.
+    zone_keys = st.session_state.get(ZONE_CITIES) or set()
+    total_before_zone = len(rows)
+    rows = rows_in_zone(rows, zone_keys)
+    if zone_keys:
+        # No Release button here on purpose: a pydeck selection cannot be
+        # cleared from Python - Streamlit documents the state as read-only -
+        # so a button that claimed to release the zone would be overruled by
+        # the chart on the very next rerun. The map itself is the control.
+        st.info(
+            f"Zone filter active: {len(rows):,} of {total_before_zone:,} targets "
+            "inside the area acquired on the radar. Click empty space on the "
+            "map in Network & Radar to release it.",
+            icon=":material/my_location:",
+        )
+
     if not rows:
         st.info("No leads match those filters.", icon=":material/search_off:")
         return
@@ -826,6 +845,85 @@ def tab_analytics() -> None:
 # --------------------------------------------------------------------------
 # Tab 5 - Network & Radar
 # --------------------------------------------------------------------------
+RADAR_KEY = "radar"              # the pydeck widget's own state key
+ZONE_RADIUS = "zone_radius_km"   # how far the zone reaches from each seed
+ZONE_CITIES = "zone_cities"      # normalised city keys currently captured
+ZONE_COUNT = "zone_count"        # leads inside the zone, for the HUD
+ZONE_SUMMARY = "zone_summary"    # what the radar should say about the zone
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def mapped_points(_signature: str) -> tuple[list[dict], list[dict], list[str]]:
+    """Vault rows plus the city points they map to.
+
+    Cached because three separate surfaces read it on every rerun, and because
+    the selection returned by the chart is a list of POSITIONS into this exact
+    point order - recomputing it per caller would risk two callers disagreeing
+    about what index 3 means.
+    """
+    rows = vault.search_leads(limit=10000)
+    points, unplaced = geo.city_points(rows)
+    return rows, points, unplaced
+
+
+def resolve_zone() -> dict:
+    """Read the radar's selection and work out what it captures.
+
+    Called once, before any tab renders. The chart's own widget state is the
+    single source of truth: st.pydeck_chart keeps it across reruns and refuses
+    to let it be set programmatically, so mirroring it into session state would
+    only create a second version that drifts.
+
+    Running before the tabs matters. The CRM grid lives in an earlier tab than
+    the radar, so resolving inside the radar would leave the grid a full rerun
+    behind the map.
+    """
+    counts = vault_stats(tick())
+    signature = f"{counts['raw']}-{counts['clean']}"
+    rows, points, unplaced = mapped_points(signature)
+
+    state = st.session_state.get(RADAR_KEY)
+    indices = []
+    if state is not None:
+        try:
+            indices = list(state["selection"]["indices"].get(geo.LAYER_COLUMNS, []))
+        except (KeyError, TypeError):
+            indices = []
+
+    radius = int(st.session_state.get(ZONE_RADIUS, 0) or 0)
+    captured = geo.capture_zone(points, indices, radius)
+    keys = zone_city_keys(points, captured)
+
+    # No selection means no zone - every surface shows everything. An empty
+    # grid would be the wrong answer to a stray click on open water.
+    st.session_state[ZONE_CITIES] = keys
+    st.session_state[ZONE_COUNT] = (
+        sum(int(points[i]["leads"]) for i in captured) if captured else None
+    )
+    return {"rows": rows, "points": points, "unplaced": unplaced,
+            "seeds": indices, "captured": captured, "keys": keys,
+            "radius": radius}
+
+
+def zone_city_keys(points: list[dict], captured: list[int]) -> set[str]:
+    """Normalised city keys for the captured points.
+
+    Leads carry a free-text ``location``; the map carries one point per city.
+    Both go through geo.normalise so "Brooklyn, New York" and "new york" land
+    on the same key and the filter cannot miss a row on spelling alone.
+    """
+    return {geo.normalise(points[i]["city"]) for i in captured
+            if 0 <= i < len(points)}
+
+
+def rows_in_zone(rows: list[dict], keys: set[str]) -> list[dict]:
+    """The leads whose city falls inside the acquired zone."""
+    if not keys:
+        return rows
+    return [r for r in rows
+            if geo.normalise((r.get("location") or "")) in keys]
+
+
 def radar_map(points: list[dict], unplaced: list[str]) -> None:
     """Cyber-tracking view of where the leads are.
 
@@ -837,9 +935,49 @@ def radar_map(points: list[dict], unplaced: list[str]) -> None:
         st.info("No leads with a recognised city yet.", icon=":material/public:")
         return
 
+    zone = st.session_state.get("_zone") or {}
+    seeds = zone.get("seeds", [])
+    captured = zone.get("captured", [])
+    radius = zone.get("radius", 0)
+
     # Layers, camera and basemap all live in core.geo, beside the coordinates
     # that feed them. See geo.deck for the arc routing and the 60-degree tilt.
-    st.pydeck_chart(geo.deck(points), height=470)
+    #
+    # on_select="rerun" makes the chart a widget: one rerun per selection
+    # change, which is not a loop. The map is NOT inside a fragment and nothing
+    # here calls st.rerun(), so a click costs exactly one pass.
+    state = st.pydeck_chart(
+        geo.deck(points, seeds, radius),
+        height=470,
+        selection_mode="multi-object",
+        on_select="rerun",
+        key="radar",
+    )
+
+    # The widget writes its own state; resolve_zone() reads it at the top of the
+    # next rerun. Nothing is written back here, so there is no second copy to
+    # drift and no rerun triggered from inside the render.
+    del state
+
+    # Tells the HUD how many targets are inside the zone. Emitted from here so
+    # it lives and dies with the radar itself.
+    zone_state(st.session_state.get(ZONE_COUNT))
+
+    if seeds:
+        locked = ", ".join(points[i]["city"] for i in captured[:6])
+        more = f" +{len(captured) - 6} more" if len(captured) > 6 else ""
+        total = sum(int(points[i]["leads"]) for i in captured)
+        st.success(
+            f"Zone acquired: {len(captured)} of {len(points)} cities, "
+            f"{total:,} targets locked. {locked}{more}",
+            icon=":material/my_location:",
+        )
+    else:
+        st.caption(
+            "Click a column to acquire it. Ctrl-click or Cmd-click to add more. "
+            "Widen the zone radius to pull in every city around the ones you "
+            "picked. Click empty space to release."
+        )
 
     if unplaced:
         st.caption(
@@ -855,7 +993,8 @@ def tab_network() -> None:
         "to pull the cluster around; the simulation settles on its own."
     )
 
-    rows = vault.search_leads(limit=10000)
+    zone = st.session_state.get("_zone") or {}
+    rows = zone.get("rows") or []
     if not rows:
         st.info("Nothing in the vault yet. Run a hunt first.",
                 icon=":material/database:")
@@ -871,15 +1010,28 @@ def tab_network() -> None:
         spring = middle.slider("Spring length", 60, 320, 150, step=10)
         repulsion = right.slider("Repulsion", 4000, 40000, 18000, step=2000)
 
-    graph = network.build(rows, max_nodes=max_nodes)
+    st.slider(
+        "Zone radius (km)", 0, 2000, key=ZONE_RADIUS, step=50,
+        help="0 locks only the cities you click. Above that, the zone pulls in "
+             "every city within this distance of any of them.",
+    )
+
+    # Everything below this line reads the zone rather than the full vault, so
+    # the grid, the graph and the counters can never disagree with the map.
+    zone_keys = st.session_state.get(ZONE_CITIES) or set()
+    scoped = rows_in_zone(rows, zone_keys)
+    graph = network.build(scoped, max_nodes=max_nodes)
 
     a, b, c, d = st.columns(4)
-    a.metric("Targets", f"{graph.total:,}")
+    a.metric("Targets", f"{graph.total:,}",
+             delta=(f"-{len(rows) - len(scoped):,} outside zone"
+                    if zone_keys and len(scoped) != len(rows) else None),
+             delta_color="off")
     b.metric("Drawn", f"{graph.shown:,}")
     c.metric("Cities", len({(r.get('location') or '').strip()
-                            for r in rows if (r.get('location') or '').strip()}))
+                            for r in scoped if (r.get('location') or '').strip()}))
     d.metric("Types", len({(r.get('lead_type') or '').strip()
-                           for r in rows if (r.get('lead_type') or '').strip()}))
+                           for r in scoped if (r.get('lead_type') or '').strip()}))
 
     graph_col, map_col = st.columns([3, 4], gap="large")
 
@@ -933,8 +1085,7 @@ def tab_network() -> None:
 
     with map_col:
         section("Global radar")
-        points, unplaced = geo.city_points(rows)
-        radar_map(points, unplaced)
+        radar_map(zone.get("points") or [], zone.get("unplaced") or [])
 
 
 # --------------------------------------------------------------------------
@@ -1074,6 +1225,10 @@ status_badge(
     "SYSTEM STATUS: NEXUS OPTIMAL" if _ready else "SYSTEM STATUS: STANDBY - NO MAILBOX",
     ok=_ready,
 )
+# Resolved before any tab draws, so the radar, the CRM grid and the graph all
+# read one answer in the same rerun.
+st.session_state["_zone"] = resolve_zone()
+
 header("NEXUS: Outreach Core",
        "Acquire targets, purify the list, run the outreach. Local only.")
 status_strip()

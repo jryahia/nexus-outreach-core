@@ -204,6 +204,28 @@ CYAN = [0, 255, 255, 200]      # target columns
 CYAN_SOFT = [0, 243, 255, 55]  # ground glow under each column
 AMBER = [255, 170, 0, 160]     # routing arcs, at the hub end
 
+# Acquired targets. Amber reads as "locked" against the cyan field, and the
+# halo gives the column a visible ring without a second draw call per frame.
+LOCKED = [255, 170, 0, 255]
+LOCKED_HALO = [57, 255, 136, 110]
+# Quarantined: everything outside the zone drops to a tenth of its alpha and
+# falls back into the void rather than disappearing, so the operator keeps the
+# shape of the full map while working inside the zone.
+DIMMED = [0, 255, 255, 20]
+DIMMED_SOFT = [0, 243, 255, 8]
+# The drawn zone itself.
+ZONE_FILL = [0, 243, 255, 40]
+ZONE_EDGE = [0, 243, 255, 190]
+
+# Stable layer ids. st.pydeck_chart refuses to keep a chart stateful across
+# reruns unless every layer declares one, and the selection state comes back
+# keyed by exactly these strings.
+LAYER_GLOW = "nx-glow"
+LAYER_ARCS = "nx-arcs"
+LAYER_COLUMNS = "nx-columns"    # the pickable layer: selection reads this key
+LAYER_ZONE = "nx-zone"
+LAYER_HALO = "nx-halo"
+
 
 def view_state(points: list[dict], zoom: float = 2.0):
     """Camera locked on the busiest city, tilted into a 3D perspective."""
@@ -237,8 +259,91 @@ def arc_rows(points: list[dict]) -> list[dict]:
     ]
 
 
-def map_layers(points: list[dict]) -> list:
-    """Ground glow, routing arcs, then extruded columns, in draw order."""
+EARTH_RADIUS_KM = 6371.0
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in kilometres.
+
+    Plain haversine rather than a projected approximation: the map spans whole
+    continents, and a flat-earth delta is wrong by hundreds of kilometres at
+    the latitudes this list actually covers.
+    """
+    from math import asin, cos, radians, sin, sqrt
+
+    phi1, phi2 = radians(lat1), radians(lat2)
+    dphi = phi2 - phi1
+    dlambda = radians(lon2 - lon1)
+    h = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2) ** 2
+    # min() guards the sqrt against a float overshoot past 1.0,
+    # which asin would reject for a near-antipodal pair.
+    return 2 * EARTH_RADIUS_KM * asin(min(1.0, sqrt(h)))
+
+
+def capture_zone(points: list[dict], seeds: list[int],
+                 radius_km: float = 0.0) -> list[int]:
+    """Indices captured by a zone seeded on ``seeds``.
+
+    The seeds are what the operator picked on the map. With a radius the zone
+    widens to every other point within ``radius_km`` of any seed, which is what
+    turns a handful of clicks into a territory. Returns positional indices into
+    ``points``, sorted, including the seeds themselves.
+    """
+    valid = [i for i in seeds if 0 <= i < len(points)]
+    if not valid or radius_km <= 0:
+        return sorted(set(valid))
+
+    captured = set(valid)
+    for index, point in enumerate(points):
+        if index in captured:
+            continue
+        for seed in valid:
+            origin = points[seed]
+            if haversine_km(float(origin["lat"]), float(origin["lon"]),
+                            float(point["lat"]), float(point["lon"])) <= radius_km:
+                captured.add(index)
+                break
+    return sorted(captured)
+
+
+def zone_polygon(points: list[dict], seeds: list[int],
+                 radius_km: float, segments: int = 48) -> list[dict]:
+    """One translucent disc per seed, as polygon rings deck.gl can fill.
+
+    Drawn in degrees rather than metres because PolygonLayer takes lon/lat
+    pairs. Longitude is divided by cos(latitude) so the disc stays circular on
+    the ground instead of squashing towards the poles.
+    """
+    from math import cos, pi, radians, sin
+
+    if radius_km <= 0:
+        return []
+    rings = []
+    for seed in seeds:
+        if not 0 <= seed < len(points):
+            continue
+        origin = points[seed]
+        lat, lon = float(origin["lat"]), float(origin["lon"])
+        dlat = radius_km / 111.32
+        dlon = dlat / max(0.2, cos(radians(lat)))
+        ring = []
+        for step in range(segments + 1):
+            angle = 2 * pi * step / segments
+            ring.append([lon + dlon * cos(angle), lat + dlat * sin(angle)])
+        rings.append({"polygon": ring, "city": origin.get("city", "")})
+    return rings
+
+
+def map_layers(points: list[dict], selected: list[int] | None = None,
+               radius_km: float = 0.0) -> list:
+    """Ground glow, zone, arcs, halo and columns, in draw order.
+
+    With a selection the map goes into quarantine: captured targets carry the
+    locked colour, everything else drops to a tenth of its alpha. The colours
+    are baked into the frame as a column rather than set per layer, so the two
+    states are one draw call instead of two overlapping layers fighting over
+    the same depth.
+    """
     import pandas as pd
     import pydeck as pdk
 
@@ -247,47 +352,102 @@ def map_layers(points: list[dict]) -> list:
     if not points:
         return []
 
+    captured = set(capture_zone(points, selected or [], radius_km))
+    quarantined = bool(captured)
+
     frame = pd.DataFrame(points)
     tallest = max(1, int(frame["leads"].max()))
+    frame["_locked"] = [i in captured for i in range(len(points))]
+    if quarantined:
+        frame["_fill"] = [LOCKED if hit else DIMMED for hit in frame["_locked"]]
+        frame["_glow"] = [LOCKED_HALO if hit else DIMMED_SOFT
+                          for hit in frame["_locked"]]
+    else:
+        frame["_fill"] = [CYAN] * len(frame)
+        frame["_glow"] = [CYAN_SOFT] * len(frame)
 
     layers = [
         pdk.Layer(
             "ScatterplotLayer",
+            id=LAYER_GLOW,
             data=frame,
             get_position=["lon", "lat"],
             get_radius="leads",
             radius_scale=26000,
             radius_min_pixels=6,
-            get_fill_color=CYAN_SOFT,
+            get_fill_color="_glow",
             pickable=False,
         )
     ]
+
+    # The zone sits under the columns so the discs read as ground, not as fog
+    # over the targets.
+    rings = zone_polygon(points, selected or [], radius_km)
+    if rings:
+        layers.append(
+            pdk.Layer(
+                "PolygonLayer",
+                id=LAYER_ZONE,
+                data=pd.DataFrame(rings),
+                get_polygon="polygon",
+                get_fill_color=ZONE_FILL,
+                get_line_color=ZONE_EDGE,
+                line_width_min_pixels=2,
+                stroked=True,
+                filled=True,
+                pickable=False,
+            )
+        )
 
     arcs = arc_rows(points)
     if arcs:
         layers.append(
             pdk.Layer(
                 "ArcLayer",
+                id=LAYER_ARCS,
                 data=pd.DataFrame(arcs),
                 get_source_position=["from_lon", "from_lat"],
                 get_target_position=["to_lon", "to_lat"],
-                get_source_color=AMBER,
-                get_target_color=CYAN,
+                get_source_color=AMBER if not quarantined else DIMMED,
+                get_target_color=CYAN if not quarantined else DIMMED,
                 get_width=1.6,
                 get_height=0.45,
                 pickable=False,
             )
         )
 
+    # A ring around every captured column. Static, not animated: a pulse would
+    # need a redraw loop, and a loop around this chart means a rerun loop.
+    if quarantined:
+        locked = frame[frame["_locked"]]
+        if not locked.empty:
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    id=LAYER_HALO,
+                    data=locked,
+                    get_position=["lon", "lat"],
+                    get_radius="leads",
+                    radius_scale=44000,
+                    radius_min_pixels=14,
+                    get_fill_color=LOCKED_HALO,
+                    stroked=True,
+                    get_line_color=[57, 255, 136, 220],
+                    line_width_min_pixels=2,
+                    pickable=False,
+                )
+            )
+
     layers.append(
         pdk.Layer(
             "ColumnLayer",
+            id=LAYER_COLUMNS,
             data=frame,
             get_position=["lon", "lat"],
             get_elevation="leads",
             elevation_scale=90000 / tallest,
             radius=70000,
-            get_fill_color=CYAN,
+            get_fill_color="_fill",
             pickable=True,
             auto_highlight=True,
             extruded=True,
@@ -296,12 +456,13 @@ def map_layers(points: list[dict]) -> list:
     return layers
 
 
-def deck(points: list[dict]):
+def deck(points: list[dict], selected: list[int] | None = None,
+         radius_km: float = 0.0):
     """The whole map, ready for ``st.pydeck_chart``."""
     import pydeck as pdk
 
     return pdk.Deck(
-        layers=map_layers(points),
+        layers=map_layers(points, selected, radius_km),
         initial_view_state=view_state(points),
         map_style=CARTO_DARK_MATTER,
         tooltip={"text": "{city}\n{leads} leads, {emails} with an email\n{types}"},

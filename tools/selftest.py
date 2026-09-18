@@ -796,6 +796,76 @@ check("dry run logged, nothing sent",
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+print("\ngeofencing")
+_zone_pts = [
+    {"city": "New York", "lat": 40.7128, "lon": -74.0060, "leads": 12,
+     "emails": 7, "types": "Agency"},
+    {"city": "Boston", "lat": 42.3601, "lon": -71.0589, "leads": 4,
+     "emails": 1, "types": "Studio"},
+    {"city": "Rome", "lat": 41.9028, "lon": 12.4964, "leads": 5,
+     "emails": 2, "types": "Creator"},
+]
+check("haversine matches a known distance",
+      abs(geo.haversine_km(41.9028, 12.4964, 45.4642, 9.1900) - 477) < 5,
+      f"{geo.haversine_km(41.9028, 12.4964, 45.4642, 9.1900):.1f} km Rome-Milan")
+check("haversine is zero for one point",
+      geo.haversine_km(10, 10, 10, 10) == 0.0)
+check("haversine crosses an ocean correctly",
+      abs(geo.haversine_km(40.7128, -74.0060, 51.5074, -0.1278) - 5570) < 20)
+
+check("a seed with no radius captures only itself",
+      geo.capture_zone(_zone_pts, [0], 0) == [0])
+check("a radius pulls in a neighbour",
+      geo.capture_zone(_zone_pts, [0], 400) == [0, 1],
+      "Boston is ~306 km from New York")
+check("a radius too small leaves the neighbour out",
+      geo.capture_zone(_zone_pts, [0], 200) == [0])
+check("a wide radius captures the whole map",
+      geo.capture_zone(_zone_pts, [0], 9000) == [0, 1, 2])
+check("no seeds captures nothing, which means no filter",
+      geo.capture_zone(_zone_pts, [], 500) == [])
+check("a stale index is ignored rather than raising",
+      geo.capture_zone(_zone_pts, [99], 500) == [])
+check("seeds are never duplicated in the capture",
+      geo.capture_zone(_zone_pts, [0, 0, 1], 0) == [0, 1])
+
+_ring = geo.zone_polygon(_zone_pts, [0], 400)
+check("one polygon ring per seed", len(_ring) == 1)
+check("the ring closes on itself",
+      _ring[0]["polygon"][0] == _ring[0]["polygon"][-1])
+check("no ring without a radius", geo.zone_polygon(_zone_pts, [0], 0) == [])
+
+# Layer contract: st.pydeck_chart refuses to stay stateful unless every layer
+# carries an id, and the selection comes back keyed by the column layer's.
+_plain = geo.map_layers(_zone_pts)
+_ids = [getattr(layer, "id", None) for layer in _plain]
+check("every layer declares an id", all(_ids), str(_ids))
+check("the column layer is the pickable one",
+      [layer.id for layer in _plain if getattr(layer, "pickable", False)]
+      == [geo.LAYER_COLUMNS])
+check("no zone layer without a selection",
+      geo.LAYER_ZONE not in _ids)
+
+_locked = geo.map_layers(_zone_pts, [0], 400)
+_locked_ids = [layer.id for layer in _locked]
+check("a selection adds the zone and the halo",
+      geo.LAYER_ZONE in _locked_ids and geo.LAYER_HALO in _locked_ids,
+      str(_locked_ids))
+_cols = [layer for layer in _locked if layer.id == geo.LAYER_COLUMNS][0]
+# pydeck serialises the frame to a list of row dicts on the layer.
+_fills = [row["_fill"] for row in _cols.data]
+check("captured targets carry the locked colour",
+      _fills[0] == geo.LOCKED and _fills[1] == geo.LOCKED)
+check("quarantined targets drop to a tenth of their alpha",
+      _fills[2] == geo.DIMMED and geo.DIMMED[3] * 10 == geo.CYAN[3],
+      f"{geo.DIMMED} vs {geo.CYAN}")
+check("an empty map still returns no layers",
+      geo.map_layers([], [0], 400) == [])
+check("the tilt survives a selection",
+      geo.view_state(_zone_pts).pitch == 60
+      and geo.view_state(_zone_pts).bearing == 30)
+
 print("\njob dispatch")
 # Regression: start_job's second parameter used to be called `target`, which is
 # also the keyword every social scraper takes. Every Instagram, TikTok, Reddit
