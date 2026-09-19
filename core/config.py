@@ -303,6 +303,20 @@ class AppConfig:
         return bool(self.proxy.strip())
 
     @property
+    def proxies(self) -> list[str]:
+        """NEXUS_PROXY as a list. One entry, or a comma-separated pool.
+
+        A residential pool is usually handed over as a comma-separated line,
+        so both shapes are accepted and a single proxy is simply a pool of one.
+        """
+        raw = (self.proxy or "").replace("\n", ",")
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
+    @property
+    def proxy_count(self) -> int:
+        return len(self.proxies)
+
+    @property
     def sender_count(self) -> int:
         return len(self.senders)
 

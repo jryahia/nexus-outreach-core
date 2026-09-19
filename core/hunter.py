@@ -11,7 +11,9 @@ which is raised deliberately because it needs a decision from the user.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import threading
 from typing import Any, Callable
 from urllib.parse import quote_plus, urljoin, urlparse
 
@@ -70,6 +72,89 @@ _TT_LINK_RE = re.compile(r'"bioLink"\s*:\s*\{\s*"link"\s*:\s*"((?:[^"\\]|\\.)*)"
 SKIPPED_NOTE = "Skipped (Already in Vault)"
 
 
+class ProxyPool:
+    """Round-robin over the configured proxies.
+
+    Thread-safe because the hunter now runs several fetches at once, and two
+    tasks taking the same index would put two concurrent requests through one
+    exit address - which is the pattern a residential pool exists to avoid.
+    """
+
+    def __init__(self, proxies: list[str]) -> None:
+        self._proxies = list(proxies)
+        self._index = 0
+        self._lock = threading.Lock()
+
+    def __bool__(self) -> bool:
+        return bool(self._proxies)
+
+    def __len__(self) -> int:
+        return len(self._proxies)
+
+    def next(self) -> str:
+        if not self._proxies:
+            return ""
+        with self._lock:
+            proxy = self._proxies[self._index % len(self._proxies)]
+            self._index += 1
+        return proxy
+
+    @staticmethod
+    def redact(proxy: str) -> str:
+        """A proxy line without its credentials. Safe for a log."""
+        if not proxy:
+            return "direct"
+        tail = proxy.rsplit("@", 1)[-1]
+        scheme = proxy.split("://", 1)[0] if "://" in proxy else ""
+        return f"{scheme}://{tail}" if scheme else tail
+
+
+# Answers that mean "bot protection noticed", as opposed to "page is missing".
+BLOCKED_STATUS = (403, 429, 503)
+MAX_FETCH_ATTEMPTS = 3
+BACKOFF_BASE = 2.5      # seconds: 2.5, 5, 10
+
+
+def resilient_fetch(fetch, job: Any, label: str, pool: "ProxyPool | None" = None,
+                    attempts: int = MAX_FETCH_ATTEMPTS):
+    """Call ``fetch(extra)`` until it stops being turned away.
+
+    Scrapling returns the blocked page rather than raising, so a 403 or a 429
+    looks like a successful fetch with no results - the hunt would quietly
+    report "no leads" instead of "you are being throttled". This retries with
+    an exponential backoff and, where a pool exists, a different exit address
+    each time.
+
+    The wait uses ``job.wait``, not sleep, so STOP still lands immediately
+    inside a backoff.
+    """
+    page = None
+    for attempt in range(1, attempts + 1):
+        extra = {}
+        if pool:
+            proxy = pool.next()
+            if proxy:
+                extra["proxy"] = proxy
+        page = fetch(extra)
+        status = getattr(page, "status", 200)
+        if status not in BLOCKED_STATUS:
+            return page
+        if attempt == attempts or job.cancelled:
+            announce(f"BLOCKED  {label} answered {status} after {attempt} "
+                     f"attempt(s)", killfeed.FAIL)
+            job.report(log=f"{label} answered {status} after {attempt} attempts")
+            return page
+        pause = BACKOFF_BASE * (2 ** (attempt - 1))
+        announce(f"RETRY    {label} answered {status}, backing off "
+                 f"{pause:.0f}s via {ProxyPool.redact(extra.get('proxy', ''))}",
+                 killfeed.WARN)
+        job.report(log=f"{label} answered {status}; retry {attempt + 1} "
+                       f"in {pause:.0f}s")
+        if job.wait(pause):
+            return page          # STOP pressed mid-backoff
+    return page
+
+
 def stealth_kwargs(cfg: AppConfig, ghost: bool = False) -> dict:
     """Extra fetcher arguments for the current stealth posture.
 
@@ -86,9 +171,18 @@ def stealth_kwargs(cfg: AppConfig, ghost: bool = False) -> dict:
     """
     if not ghost:
         return {}
-    extra: dict[str, Any] = {"block_webrtc": True, "disable_resources": True}
+    # Scrapling already generates a matching real User-Agent and a full
+    # browserforge fingerprint on every launch, so there is no UA to inject
+    # and no canvas hook to install here - that work is done before this
+    # function is reached. What Ghost adds on top is the WebRTC block, a
+    # smaller request surface, and an exit address.
+    extra: dict[str, Any] = {
+        "block_webrtc": True,        # stops the real local IP leaking past a proxy
+        "disable_resources": True,   # fewer requests, smaller fingerprint
+        "allow_webgl": True,         # deliberately ON: absent WebGL flags a bot
+    }
     if cfg.has_proxy:
-        extra["proxy"] = cfg.proxy
+        extra["proxy"] = cfg.proxies[0]
     return extra
 
 
@@ -211,6 +305,77 @@ def _rank_emails(emails: list[str], site_domain: str) -> list[str]:
     return sorted(dict.fromkeys(emails), key=score)
 
 
+# How many targets are enriched at once. Each one is a small HTTP crawl of a
+# business site, so the ceiling is politeness rather than memory: five parallel
+# requests to five different domains is ordinary traffic, and the same five
+# aimed at one host is not. Kept low deliberately.
+ENRICH_CONCURRENCY = 5
+
+
+async def _enrich_one(lead: dict, cfg: AppConfig, job: Any, semaphore,
+                      ghost: bool = False) -> dict:
+    """Resolve one lead's email inside the concurrency budget.
+
+    emails_from_website is a synchronous crawl built on curl_cffi, so it runs
+    in a worker thread rather than being rewritten as a coroutine. asyncio is
+    doing what it is good at here - holding many slow IO operations open at
+    once - without a rewrite of the fetch layer underneath it.
+    """
+    async with semaphore:
+        if job.cancelled or not lead.get("website"):
+            return lead
+        try:
+            emails = await asyncio.to_thread(
+                emails_from_website, lead["website"],
+                timeout=max(10, cfg.request_timeout // 1000), job=job)
+        except Exception as exc:
+            job.report(log=f"  {lead['website']} failed ({type(exc).__name__})")
+            return lead
+        if emails:
+            lead["email"] = emails[0]
+    return lead
+
+
+async def _enrich_all(leads: list[dict], cfg: AppConfig, job: Any,
+                      ghost: bool = False) -> None:
+    semaphore = asyncio.Semaphore(ENRICH_CONCURRENCY)
+    tasks = [asyncio.create_task(_enrich_one(lead, cfg, job, semaphore, ghost))
+             for lead in leads]
+    done = 0
+    try:
+        for coro in asyncio.as_completed(tasks):
+            await coro
+            done += 1
+            job.report(current=done,
+                       message=f"{done}/{len(leads)} sites checked")
+            if job.cancelled:
+                break
+    finally:
+        # STOP has to cancel what is in flight, not just stop scheduling more.
+        # Without this a cancelled hunt would keep crawling in the background
+        # while the UI reported it stopped.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def enrich_websites(leads: list[dict], cfg: AppConfig, job: Any,
+                    ghost: bool = False) -> list[dict]:
+    """Fill in emails for a batch of leads, several at a time.
+
+    Runs its own event loop on the worker thread it is already on, which is
+    the same shape core.killfeed uses. No loop is threaded through Streamlit.
+    """
+    targets = [lead for lead in leads if lead.get("website")]
+    if not targets:
+        return leads
+    announce(f"ENRICH   {len(targets)} sites, {ENRICH_CONCURRENCY} at a time",
+             killfeed.INFO)
+    asyncio.run(_enrich_all(targets, cfg, job, ghost))
+    return leads
+
+
 # ---------------------------------------------------------------------------
 # Google Maps
 # ---------------------------------------------------------------------------
@@ -303,16 +468,19 @@ def scrape_google_maps(
     job.report(total=len(leads), current=0,
                message=f"{len(leads)} businesses, checking sites for emails")
 
+    # The dedup gate runs first and in one pass, so the concurrent stage only
+    # ever sees targets worth spending a request on. A run-local `seen` set
+    # rides alongside the vault snapshot: with several fetches in flight, two
+    # cards for the same business would otherwise both clear a gate that only
+    # knows what was on file when the hunt started.
     fresh: list[dict] = []
     skipped = 0
+    seen: set[str] = set()
     for index, lead in enumerate(leads, start=1):
         if job.cancelled:
-            job.report(log="Stopped during website crawl")
+            job.report(log="Stopped before the website crawl")
             break
 
-        # The dedup gate. Checked before the site is fetched, so a business we
-        # already hold costs zero requests, zero bandwidth and zero proxy budget
-        # instead of a five-page contact crawl.
         match = vault.match_known(lead, known)
         if match:
             skipped += 1
@@ -320,19 +488,24 @@ def scrape_google_maps(
                        message=f"{index}/{len(leads)} - {skipped} already on file")
             continue
 
-        if lead["website"]:
-            try:
-                emails = emails_from_website(
-                    lead["website"], timeout=max(10, cfg.request_timeout // 1000), job=job
-                )
-            except Exception as exc:
-                emails = []
-                job.report(log=f"  {lead['website']} failed ({type(exc).__name__})")
-            lead["email"] = emails[0] if emails else ""
+        key = vault.norm_domain(lead.get("website", "")) or \
+            vault.norm_name(lead.get("name", ""))
+        if key and key in seen:
+            skipped += 1
+            job.report(current=index,
+                       log=f"{SKIPPED_NOTE}: {lead['name']} (duplicate in this run)")
+            continue
+        if key:
+            seen.add(key)
         fresh.append(lead)
+
+    # The slow half, run several at a time.
+    job.report(total=len(fresh), current=0,
+               message=f"Checking {len(fresh)} sites for addresses")
+    enrich_websites(fresh, cfg, job, ghost)
+    for lead in fresh:
         mark = lead["email"] or "no email"
-        job.report(current=index, message=f"{index}/{len(leads)} {lead['name']}",
-                   log=f"{lead['name']} [{lead['lead_type']}] -> {mark}")
+        job.report(log=f"{lead['name']} [{lead['lead_type']}] -> {mark}")
 
     hits = sum(1 for lead in fresh if lead["email"])
     tail = f", {skipped} already in the vault" if skipped else ""

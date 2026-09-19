@@ -17,12 +17,44 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core import cannon, hunter, purifier, templates, vault  # noqa: E402
+from core import cannon, hunter, purifier, templates, vault, verify  # noqa: E402
 from core import config as config_module  # noqa: E402
 from core.config import (  # noqa: E402
     AppConfig, SenderAccount, SmtpConfig, parse_accounts, parse_accounts_report,
 )
 from ui.state import Job, start_job  # noqa: E402
+
+# The send path resolves MX records before it builds a message. Left alone that
+# would drag the whole suite onto the network and make it fail whenever DNS
+# hiccups, so every check below runs against a fixed table instead. The real
+# resolver has its own checks further down, driven through the same seam.
+_MX_TABLE = {
+    "x.com": ["10 mx.x.com."],
+    "y.com": ["10 mx.y.com."],
+    "b.com": ["10 mx.b.com."],
+    "acme.com": ["10 mx.acme.com."],
+    "alpha.com": ["10 mx.alpha.com."],
+    "beta.com": ["10 mx.beta.com."],
+    "epsilon.io": ["10 mx.epsilon.io."],
+    "tonefilms.com": ["10 mx.tonefilms.com."],
+    "tone.com": ["10 mx.tone.com."],
+    "clip.com": ["10 mx.clip.com."],
+    "d.com": ["10 mx.d.com."],
+    "mydomain.com": ["10 mx.mydomain.com."],
+    "agency.com": ["10 mx.agency.com."],
+    "bliss.it": ["10 mx.bliss.it."],
+    "target.com": ["10 mx.target.com."],
+    "example.com": ["10 mx.example.com."],
+}
+
+
+def _offline_mx(domain: str, record: str, timeout: float) -> list[str]:
+    if record != "MX":
+        return ["203.0.113.1"] if domain in _MX_TABLE else []
+    return _MX_TABLE.get(domain, ["10 mx.fallback."])
+
+
+verify.configure(resolve=_offline_mx)
 
 FAILURES: list[str] = []
 
@@ -836,6 +868,196 @@ check("dry run logged, nothing sent",
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+print("\nzero-bounce armour")
+_MX_FIXTURE = {
+    ("live.test", "MX"): ["10 mx.live.test."],
+    ("implicit.test", "MX"): [],
+    ("implicit.test", "A"): ["203.0.113.9"],
+    ("parked.test", "MX"): [],
+    ("parked.test", "A"): [],
+    ("parked.test", "AAAA"): [],
+}
+
+
+def _fixture_resolver(domain, record, timeout):
+    if domain == "gone.test":
+        raise verify.DefinitiveNegative("no such domain")
+    if domain == "flaky.test":
+        raise verify.TransientFailure("resolver timed out")
+    return _MX_FIXTURE.get((domain, record), [])
+
+
+_mx = verify.MailDomainCache(resolve=_fixture_resolver)
+check("a domain with MX records is deliverable",
+      _mx.verdict("a@live.test").status == verify.DELIVERABLE)
+# RFC 5321: no MX but a valid A record still accepts mail. Dropping those
+# would discard exactly the small self-hosted businesses this tool hunts.
+check("no MX but an A record still counts",
+      _mx.verdict("a@implicit.test").status == verify.DELIVERABLE,
+      _mx.verdict("a@implicit.test").detail)
+check("a parked domain is dropped",
+      _mx.verdict("a@parked.test").status == verify.NO_MAIL_SERVER)
+check("a domain that does not exist is dropped",
+      _mx.verdict("a@gone.test").status == verify.NO_MAIL_SERVER)
+# The distinction that protects good leads: a resolver having a bad moment
+# says nothing about the domain, so the lead is sent anyway.
+check("a transient failure never drops a lead",
+      _mx.verdict("a@flaky.test").status == verify.UNKNOWN
+      and _mx.verdict("a@flaky.test").deliverable is True)
+_before = _mx.stats()["lookups"]
+for _ in range(30):
+    _mx.verdict("someone@live.test")
+check("a domain is resolved once, not once per lead",
+      _mx.stats()["lookups"] == _before, str(_mx.stats()))
+
+# The gate has to be wired into the send path, not merely available.
+_mx_cfg = AppConfig(smtp=SmtpConfig(email="a@x.com", app_password="p"),
+                    senders=[SenderAccount("a@x.com", "p")], coffee_every=0)
+verify.configure(resolve=_fixture_resolver)
+_mx_job = Job(key="mx")
+_mx_stats = cannon.send_campaign(
+    job=_mx_job, cfg=_mx_cfg,
+    leads=[{"name": "good", "email": "a@live.test"},
+           {"name": "dead", "email": "b@parked.test"}],
+    subject="s", body="b", min_delay=0, max_delay=0, dry_run=True)
+check("an undeliverable domain never reaches the cannon",
+      _mx_stats["undeliverable"] == 1 and _mx_stats["sent"] == 1,
+      str(_mx_stats))
+check("the drop is logged where analytics can see it",
+      any(r["status"] == cannon.SKIPPED and verify.DROP_REASON in r["detail"]
+          for r in _mx_job.snapshot()["rows"]))
+verify.configure(resolve=_offline_mx)      # back to the suite-wide fixture
+
+# ---------------------------------------------------------------------------
+print("\nghost protocol v2")
+_pool = hunter.ProxyPool(["http://u:p@a.test:1", "http://u:p@b.test:2"])
+check("the pool rotates", [_pool.next() for _ in range(4)] ==
+      ["http://u:p@a.test:1", "http://u:p@b.test:2"] * 2)
+check("an empty pool is falsy and yields nothing",
+      not hunter.ProxyPool([]) and hunter.ProxyPool([]).next() == "")
+# A proxy line carries credentials; a log line must not.
+check("credentials never reach a log line",
+      "u:p" not in hunter.ProxyPool.redact("http://u:p@a.test:1"),
+      hunter.ProxyPool.redact("http://u:p@a.test:1"))
+check("a comma-separated pool is parsed",
+      AppConfig(proxy="http://a:1, http://b:2,http://c:3").proxy_count == 3)
+check("one proxy is a pool of one",
+      AppConfig(proxy="http://a:1").proxies == ["http://a:1"])
+check("no proxy is an empty pool", AppConfig().proxies == [])
+# WebGL stays enabled on purpose: a browser reporting no WebGL at all is a
+# stronger bot signal than the fingerprint it would have exposed.
+check("ghost leaves WebGL enabled",
+      hunter.stealth_kwargs(AppConfig(), True).get("allow_webgl") is True)
+check("403, 429 and 503 all count as being turned away",
+      set(hunter.BLOCKED_STATUS) == {403, 429, 503})
+
+
+class _Turnstile:
+    """Answers 429 a few times, then relents."""
+
+    def __init__(self, fails):
+        self.fails = fails
+        self.attempts = 0
+        self.proxies = []
+
+    def __call__(self, extra):
+        self.attempts += 1
+        self.proxies.append(extra.get("proxy", ""))
+        return type("P", (), {"status": 429 if self.attempts <= self.fails else 200})()
+
+
+_gate = _Turnstile(fails=2)
+_backoff_job = Job(key="backoff")
+hunter.BACKOFF_BASE, _real_backoff = 0.01, hunter.BACKOFF_BASE
+_page = hunter.resilient_fetch(_gate, _backoff_job, "test",
+                               hunter.ProxyPool(["p1", "p2", "p3"]))
+check("a throttled fetch is retried rather than reported as empty",
+      _page.status == 200 and _gate.attempts == 3, str(_gate.attempts))
+check("each retry goes out through a different exit address",
+      len(set(_gate.proxies)) == 3, str(_gate.proxies))
+_hard = _Turnstile(fails=99)
+_page2 = hunter.resilient_fetch(_hard, Job(key="hard"), "test")
+check("a permanently blocked fetch gives up rather than looping",
+      _page2.status == 429 and _hard.attempts == hunter.MAX_FETCH_ATTEMPTS,
+      str(_hard.attempts))
+# STOP must land inside a backoff, not after it.
+_stop_job = Job(key="stopback")
+_stop_job.stop_event.set()
+_stopped = _Turnstile(fails=99)
+hunter.resilient_fetch(_stopped, _stop_job, "test")
+check("STOP is honoured inside a backoff", _stopped.attempts == 1,
+      str(_stopped.attempts))
+hunter.BACKOFF_BASE = _real_backoff
+
+# ---------------------------------------------------------------------------
+print("\nconcurrent enrichment")
+check("the concurrency budget is bounded and modest",
+      1 < hunter.ENRICH_CONCURRENCY <= 8, str(hunter.ENRICH_CONCURRENCY))
+
+_seen_parallel = {"peak": 0, "now": 0}
+_par_lock = threading.Lock()
+
+
+def _slow_crawl(url, timeout=20, job=None):
+    with _par_lock:
+        _seen_parallel["now"] += 1
+        _seen_parallel["peak"] = max(_seen_parallel["peak"], _seen_parallel["now"])
+    time.sleep(0.05)
+    with _par_lock:
+        _seen_parallel["now"] -= 1
+    return ["found@" + url.split("//")[-1]]
+
+
+_real_crawl = hunter.emails_from_website
+hunter.emails_from_website = _slow_crawl
+_batch = [{"name": f"b{i}", "website": f"https://s{i}.test", "email": ""}
+          for i in range(12)]
+_t0 = time.perf_counter()
+hunter.enrich_websites(_batch, AppConfig(), Job(key="par"))
+_par_elapsed = time.perf_counter() - _t0
+hunter.emails_from_website = _real_crawl
+
+check("every lead in the batch is enriched",
+      all(lead["email"] for lead in _batch))
+check("the semaphore is never breached",
+      _seen_parallel["peak"] <= hunter.ENRICH_CONCURRENCY,
+      f"peak {_seen_parallel['peak']} vs limit {hunter.ENRICH_CONCURRENCY}")
+check("the batch really did run in parallel",
+      _par_elapsed < 12 * 0.05 * 0.7, f"{_par_elapsed:.3f}s for 12 x 0.05s")
+check("an empty batch is safe", hunter.enrich_websites([], AppConfig(),
+                                                       Job(key="empty")) == [])
+
+# ---------------------------------------------------------------------------
+print("\ncrash resume")
+# The guarantee is not a checkpoint file: every send is written to WAL-backed
+# SQLite before the next one starts, and blocked_lookup gates the whole queue
+# against that table. A killed process therefore resumes by construction.
+_resume_db = TEST_DB.parent / "resume-test.db"
+for _suffix in ("", "-wal", "-shm"):
+    Path(str(_resume_db) + _suffix).unlink(missing_ok=True)
+vault.init_db(_resume_db, migrate=False)
+for _addr in ("one@live.test", "two@live.test"):
+    vault.log_event({"email": _addr, "status": "Sent", "campaign": "interrupted"},
+                    _resume_db)
+_queue = ["one@live.test", "two@live.test", "three@live.test"]
+_already = vault.blocked_lookup(_queue, sent_status="Sent", path=_resume_db)
+check("addresses already emailed are refused on the next run",
+      set(_already) == {"one@live.test", "two@live.test"}, str(sorted(_already)))
+check("an address not yet reached is still open",
+      "three@live.test" not in _already)
+check("the reason survives for the operator to read",
+      "past campaign" in _already["one@live.test"], _already["one@live.test"])
+# A dry run writes Preview rows; those must never look like completed sends,
+# or one rehearsal would permanently lock the list out.
+vault.log_event({"email": "four@live.test", "status": "Preview"}, _resume_db)
+check("a rehearsal does not count as a send",
+      "four@live.test" not in vault.blocked_lookup(["four@live.test"],
+                                                   sent_status="Sent",
+                                                   path=_resume_db))
+for _suffix in ("", "-wal", "-shm"):
+    Path(str(_resume_db) + _suffix).unlink(missing_ok=True)
+
 print("\noutpost webhooks")
 from core import killfeed, outpost  # noqa: E402
 

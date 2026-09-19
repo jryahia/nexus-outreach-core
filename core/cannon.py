@@ -33,7 +33,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 from typing import Any
 
-from core import killfeed, outpost, vault
+from core import killfeed, outpost, vault, verify
 from core.config import AppConfig, SenderAccount
 from core.templates import Template
 
@@ -53,6 +53,9 @@ LOG_FIELDS = ("timestamp", "email", "sender", "status", "subject", "detail",
 SENT = "Sent"
 FAILED = "Failed"
 SKIPPED = "Skipped"
+# A domain that cannot receive mail at all. Logged as a skip rather than a
+# failure: nothing went wrong on the wire, the lead was never worth a socket.
+MX_INVALID = verify.DROP_REASON
 PREVIEW = "Preview"  # dry run: rendered and logged, never put on the wire
 
 
@@ -406,7 +409,7 @@ def send_campaign(
     held_back = leads[len(queue):]
 
     stats = {"sent": 0, "failed": 0, "skipped": len(held_back), "blocked": 0,
-             "dry_run": dry_run, "senders": len(senders),
+             "undeliverable": 0, "dry_run": dry_run, "senders": len(senders),
              "variants": {t.variant: 0 for t in variants if t.variant}}
 
     rotation = (f"rotating {len(senders)} mailboxes" if len(senders) > 1
@@ -455,6 +458,22 @@ def send_campaign(
                 break
 
             email = (lead.get("email") or "").strip().lower()
+
+            # Zero-bounce gate. A domain with no mail server behind it can
+            # only ever produce a hard bounce, and bounces are scored against
+            # the sending domain - so it is cheaper to lose the lead than to
+            # spend reputation on it. Cached per domain, and only a definitive
+            # negative drops: a resolver timeout sends anyway.
+            if email and not verify.deliverable(email):
+                stats["undeliverable"] += 1
+                stats["skipped"] += 1
+                log_event(job, email, "-", SKIPPED, detail=MX_INVALID,
+                          campaign=campaign)
+                job.report(log=f"dropped {email} | {MX_INVALID}",
+                           current=index + 1,
+                           message=f"{stats['sent']} sent, "
+                                   f"{stats['undeliverable']} undeliverable")
+                continue
 
             # The blacklist gate. Checked before the message is built, so a
             # blocked address never reaches an SMTP connection at all.
@@ -569,6 +588,8 @@ def send_campaign(
         stats["disabled_senders"] = dict(pool.disabled)
     verb = "previewed" if dry_run else "sent"
     tail = f", {stats['blocked']} skipped by the blacklist" if stats["blocked"] else ""
+    if stats["undeliverable"]:
+        tail += f", {stats['undeliverable']} dropped with no mail server"
     job.report(message=f"{stats['sent']} {verb}, {stats['failed']} failed{tail}")
     killfeed.push(
         f"CAMPAIGN {campaign} complete: {stats['sent']} {verb}, "
