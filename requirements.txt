@@ -20,6 +20,13 @@ pydeck==0.9.3
 python-dotenv==1.2.1
 email-validator==2.3.0
 
+# --- Live link -------------------------------------------------------------
+# The kill-feed WebSocket. Already present as a transitive dependency, pinned
+# here because core/killfeed.py imports it directly and a transitive pin is
+# not a promise. FastAPI is deliberately absent: this is one socket with one
+# handler, and starlette + pydantic would be carried for nothing.
+websockets==16.1.1
+
 # NOTE: after pip install you MUST run the browser bootstrap once:
 #   scrapling install
 # It downloads the patched Chromium build and the fingerprint datapoints.

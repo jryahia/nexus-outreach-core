@@ -292,6 +292,15 @@ class AppConfig:
     request_timeout: int = 30000
     tiktok_profile_dir: str = ""
     ig_profile_dir: str = ""
+    # Ghost Protocol. A proxy string Scrapling understands, or "" for none.
+    proxy: str = ""
+    # The Outpost. Treated as a credential: it usually embeds an auth token.
+    webhook_url: str = ""
+    webhook_detail: bool = False
+
+    @property
+    def has_proxy(self) -> bool:
+        return bool(self.proxy.strip())
 
     @property
     def sender_count(self) -> int:
@@ -357,6 +366,9 @@ def load_config(refresh: bool = True) -> AppConfig:
         postal_address=os.getenv("POSTAL_ADDRESS", "").strip(),
         headless=_bool("HEADLESS", True),
         request_timeout=_int("REQUEST_TIMEOUT", 30000),
+        proxy=os.getenv("NEXUS_PROXY", "").strip(),
+        webhook_url=os.getenv("NEXUS_WEBHOOK_URL", "").strip(),
+        webhook_detail=_bool("NEXUS_WEBHOOK_DETAIL", False),
         tiktok_profile_dir=os.getenv("TIKTOK_PROFILE_DIR", "").strip(),
         ig_profile_dir=os.getenv("IG_PROFILE_DIR", "").strip(),
     )

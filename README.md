@@ -5,8 +5,13 @@ public sources, cleans the list down to deliverable addresses, and runs cold
 email campaigns at a human cadence across rotating mailboxes — behind a
 WebGL command-centre interface built on Streamlit.
 
-Everything runs on your machine. No SaaS, no account, no data leaving the box
-except the requests you explicitly trigger.
+Everything runs on your machine. No SaaS, no account, no telemetry. Scraped
+leads live in a local SQLite file and nothing is uploaded anywhere.
+
+Two outbound paths exist and both are off until you configure them: the
+scrapers fetch the pages you ask for, and `NEXUS_WEBHOOK_URL` — when set —
+POSTs operational events to your own automation endpoint. That webhook carries
+counters and status only unless you switch `NEXUS_WEBHOOK_DETAIL` on.
 
 ![The NEXUS interface](docs/interface.png)
 
@@ -43,7 +48,18 @@ address never reaches an SMTP connection.
 
 **Analyse** — Live metrics, delivery timeline, A/B comparison, a 3D geographic
 radar of where the leads are, and a force-directed graph wiring every target to
-its type and city.
+its type and city. Draw a zone on the radar and the grid, the graph and the
+counters all narrow to it.
+
+**Relay** — Optional. A loopback WebSocket streams every SMTP handshake and
+extraction into the HUD terminal as it happens, bypassing the rerun cycle
+entirely, and a webhook can push the same events to n8n, GoHighLevel or a
+WhatsApp flow so a campaign can be watched from a phone.
+
+**Ghost Protocol** — A toggle that blocks the WebRTC local-address leak, drops
+images and fonts to shrink the fingerprint, and routes through `NEXUS_PROXY`
+when one is configured. Without a proxy it says so rather than implying cover
+it does not provide.
 
 ![The radar and network view](docs/radar.png)
 
@@ -113,6 +129,8 @@ core/
   geo.py            Offline geocoder and deck.gl map construction
   network.py        Force-directed graph model
   config.py         Environment parsing and validation
+  outpost.py        Fire-and-forget webhooks to an external automation
+  killfeed.py       Loopback WebSocket that streams operations live
 ui/
   state.py          Thread-safe job handles for background work
   theme.py          Stylesheet and the WebGL/HUD runtime
@@ -125,6 +143,12 @@ never blocks and STOP is always clickable. Workers never touch Streamlit APIs;
 they report into a lock-guarded structure the UI polls. Waiting uses
 `Event.wait`, not `sleep`, so STOP lands mid-gap instead of minutes late —
 measured at 0.000s.
+
+**The relay.** The kill-feed binds `127.0.0.1` only and requires a token minted
+per process, because the feed narrates campaigns and can carry addresses. The
+webhook worker is a bounded queue drained by a daemon thread: an unreachable
+endpoint costs the send path microseconds and is dropped, never retried into a
+stall.
 
 **Storage.** SQLite in WAL mode, one short-lived connection per operation.
 Nothing is cached across threads, which is what lets the campaign worker write

@@ -309,6 +309,46 @@ def run_static_checks(cfg: AppConfig, result: ScanResult | None = None) -> ScanR
                    "so each variant is always sent by the same mailbox. An odd "
                    "number of mailboxes keeps the test clean.", VAULT)
 
+    # -- Outpost, kill-feed and stealth posture -----------------------------
+    from core import killfeed, outpost
+
+    post = outpost.outpost()
+    if post.enabled:
+        # redact() keeps the scheme and host and drops the path, which is where
+        # n8n and GoHighLevel both put the auth token.
+        result.add("Webhook outpost", OK,
+                   f"firing events to {post.target}", STORAGE)
+        if cfg.webhook_detail:
+            result.add("Webhook payload", WARN,
+                       "NEXUS_WEBHOOK_DETAIL is on: addresses, names and "
+                       "subjects are sent to the endpoint. Off by default.",
+                       STORAGE)
+        else:
+            result.add("Webhook payload", OK,
+                       "counters and status only, no personal data", STORAGE)
+    else:
+        result.add("Webhook outpost", OK,
+                   "not configured - nothing leaves this machine", STORAGE)
+
+    feed = killfeed.feed()
+    if feed.started:
+        result.add("Kill-feed link", OK,
+                   f"streaming on 127.0.0.1:{feed.port}, loopback only, "
+                   f"token required", STORAGE)
+    else:
+        result.add("Kill-feed link", WARN,
+                   feed.error or "not started - the HUD terminal falls back to "
+                                 "the polled activity log", STORAGE)
+
+    if cfg.has_proxy:
+        result.add("Ghost Protocol", OK,
+                   "NEXUS_PROXY is set - Ghost routes through it", CREDENTIALS)
+    else:
+        result.add("Ghost Protocol", WARN,
+                   "No NEXUS_PROXY set. Ghost still blocks WebRTC leaks and "
+                   "trims the fingerprint, but requests leave from this "
+                   "machine's own address.", CREDENTIALS)
+
     if (ROOT / ".gitignore").exists():
         result.add(".gitignore", OK, "Present - .env and data/ stay out of git", STORAGE)
     else:

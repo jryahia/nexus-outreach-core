@@ -834,6 +834,97 @@ check("dry run logged, nothing sent",
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+print("\noutpost webhooks")
+from core import killfeed, outpost  # noqa: E402
+
+_off = outpost.WebhookOutpost("")
+check("no url means the outpost is silent",
+      _off.enabled is False and _off.fire(outpost.EMAIL_SENT, sent=1) is False)
+
+_post = outpost.WebhookOutpost("https://hooks.example.com/abc/secret-token")
+_body = _post.build_payload(outpost.EMAIL_SENT, {
+    "campaign": "c1", "sent": 3, "failed": 0,
+    "email": "lead@target.com", "name": "Target Person",
+    "website": "https://target.com", "phone": "+15550000",
+})
+# This is the one path that sends scraped third-party data off the machine, so
+# the default has to hold back anything that identifies a person.
+check("personal fields are withheld by default",
+      not any(f in _body["data"] for f in outpost.PERSONAL_FIELDS),
+      str(sorted(_body["data"])))
+check("counters still travel",
+      _body["data"]["sent"] == 3 and _body["data"]["campaign"] == "c1")
+check("the payload says it was redacted", _body.get("redacted") is True)
+check("the event name is carried", _body["event"] == outpost.EMAIL_SENT)
+
+_detail = outpost.WebhookOutpost("https://hooks.example.com/abc", include_personal=True)
+_full = _detail.build_payload(outpost.EMAIL_SENT, {"email": "lead@target.com"})
+check("opt-in detail includes the address",
+      _full["data"].get("email") == "lead@target.com")
+check("opt-in detail drops the redacted flag", "redacted" not in _full)
+
+# The URL usually carries an auth token in its path.
+check("redact keeps the host and drops the path",
+      outpost.redact("https://hooks.example.com/abc/secret-token")
+      == "https://hooks.example.com/***",
+      outpost.redact("https://hooks.example.com/abc/secret-token"))
+check("redact says so when nothing is set", outpost.redact("") == "not set")
+check("stats never carry the token",
+      "secret-token" not in str(_post.stats()), str(_post.stats()))
+
+# A webhook that cannot be reached must not slow a campaign down.
+_dead = outpost.WebhookOutpost("http://127.0.0.1:1/nothing", timeout=1)
+_t0 = time.perf_counter()
+for _i in range(20):
+    _dead.fire(outpost.EMAIL_SENT, sent=_i)
+_elapsed = time.perf_counter() - _t0
+check("firing never blocks the send path", _elapsed < 0.25,
+      f"20 fires in {_elapsed*1000:.1f}ms")
+check("a bounded queue drops rather than grows",
+      _dead._queue.maxsize == outpost.MAX_QUEUED)
+
+# ---------------------------------------------------------------------------
+print("\nkill-feed")
+_feed = killfeed.KillFeed()
+check("a feed that was never started still accepts a push",
+      _feed.push("line before start") is None)
+check("pushes are buffered for a client that connects late",
+      _feed.stats()["buffered"] == 1, str(_feed.stats()))
+check("the backlog is bounded", _feed._backlog.maxlen == killfeed.BACKLOG)
+for _i in range(killfeed.BACKLOG + 50):
+    _feed.push(f"flood {_i}")
+check("a long campaign cannot grow the buffer forever",
+      len(_feed._backlog) == killfeed.BACKLOG, str(len(_feed._backlog)))
+check("an empty line is ignored", _feed.push("") is None)
+check("a level rides with every line",
+      killfeed.OK != killfeed.FAIL and killfeed.FIRE != killfeed.INFO)
+check("no token before start, so nothing can connect", _feed.token == "")
+
+# ---------------------------------------------------------------------------
+print("\nghost protocol")
+_plain = AppConfig()
+check("stealth is off unless asked for", hunter.stealth_kwargs(_plain, False) == {})
+_ghost = hunter.stealth_kwargs(_plain, True)
+# Without a proxy the traffic still leaves from this machine. The UI says so,
+# and this check is what stops the code quietly implying otherwise.
+check("ghost blocks the WebRTC local-address leak",
+      _ghost.get("block_webrtc") is True, str(_ghost))
+check("ghost trims the fingerprint surface",
+      _ghost.get("disable_resources") is True)
+check("ghost claims no proxy when none is configured", "proxy" not in _ghost,
+      str(_ghost))
+_proxied = AppConfig(proxy="http://user:pw@proxy.example:8080")
+check("a configured proxy reaches the fetcher",
+      hunter.stealth_kwargs(_proxied, True).get("proxy")
+      == "http://user:pw@proxy.example:8080")
+check("has_proxy reflects the config",
+      _proxied.has_proxy is True and _plain.has_proxy is False)
+for _fn in (hunter.scrape_google_maps, hunter.scrape_instagram,
+            hunter.scrape_tiktok, hunter.scrape_reddit, hunter.scrape_discord):
+    check(f"{_fn.__name__} accepts the stealth posture",
+          "ghost" in inspect.signature(_fn).parameters)
+
 print("\nuniversal mailbox pool")
 _long = parse_accounts(
     "smtp.gmail.com:587:me@gmail.com:pw1,smtp.zoho.eu:465:hi@example.com:pw2",

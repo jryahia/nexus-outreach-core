@@ -17,7 +17,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 
 from scrapling.fetchers import Fetcher, StealthyFetcher
 
-from core import vault
+from core import killfeed, outpost, vault
 from core.config import AppConfig
 from core.purifier import (
     LEAD_FIELDS,
@@ -70,8 +70,38 @@ _TT_LINK_RE = re.compile(r'"bioLink"\s*:\s*\{\s*"link"\s*:\s*"((?:[^"\\]|\\.)*)"
 SKIPPED_NOTE = "Skipped (Already in Vault)"
 
 
+def stealth_kwargs(cfg: AppConfig, ghost: bool = False) -> dict:
+    """Extra fetcher arguments for the current stealth posture.
+
+    Ghost Protocol is honest about what it can deliver. Two of these are real
+    and take effect immediately; the third depends on the operator:
+
+    * ``block_webrtc`` stops the browser announcing the real local address
+      through WebRTC, which is the usual way a proxied scrape leaks its origin.
+    * ``disable_resources`` drops images and fonts, which both speeds the crawl
+      and shrinks the fingerprint surface.
+    * ``proxy`` is only applied when NEXUS_PROXY is set. Without it the traffic
+      still leaves from this machine's own address, and the UI says so rather
+      than implying cover that does not exist.
+    """
+    if not ghost:
+        return {}
+    extra: dict[str, Any] = {"block_webrtc": True, "disable_resources": True}
+    if cfg.has_proxy:
+        extra["proxy"] = cfg.proxy
+    return extra
+
+
 class LoginRequired(RuntimeError):
     """The platform served a login wall. The message carries the fix."""
+
+
+def announce(text: str, level: str = killfeed.INFO) -> None:
+    """One line to the live terminal. Never raises into a scrape."""
+    try:
+        killfeed.push(text, level)
+    except Exception:
+        pass
 
 
 def load_known(skip_known: bool, job: Any) -> dict[str, set[str]]:
@@ -226,6 +256,7 @@ def scrape_google_maps(
     location: str = DEFAULT_MAPS_LOCATION,
     max_results: int = 40,
     skip_known: bool = True,
+    ghost: bool = False,
 ) -> list[dict]:
     keyword = (keyword or DEFAULT_MAPS_KEYWORD).strip()
     location = (location or DEFAULT_MAPS_LOCATION).strip()
@@ -240,6 +271,7 @@ def scrape_google_maps(
         network_idle=False,
         cookies=GOOGLE_CONSENT_COOKIES,
         page_action=_feed_scroller(job, max_results),
+        **stealth_kwargs(cfg, ghost),
     )
 
     cards = page.css("div.Nv2PK")
@@ -305,6 +337,10 @@ def scrape_google_maps(
     hits = sum(1 for lead in fresh if lead["email"])
     tail = f", {skipped} already in the vault" if skipped else ""
     job.report(message=f"{len(fresh)} new businesses, {hits} with an email{tail}")
+    announce(f"HUNT     Maps '{query}': {len(fresh)} new, {hits} with an email",
+             killfeed.OK if hits else killfeed.WARN)
+    outpost.fire(outpost.HUNT_FINISHED, source="Google Maps", query=query,
+                 found=len(fresh), with_email=hits, skipped=skipped)
     return fresh
 
 
@@ -439,19 +475,21 @@ def _ig_walled(page) -> bool:
     return "/accounts/login" in str(page.url) or "loginForm" in page.html_content[:20000]
 
 
-def _ig_fetch(url: str, cfg: AppConfig):
+def _ig_fetch(url: str, cfg: AppConfig, ghost: bool = False):
     return StealthyFetcher.fetch(
         url,
         headless=cfg.headless,
         timeout=max(cfg.request_timeout, 60000),
         network_idle=False,
         google_search=True,
+        **stealth_kwargs(cfg, ghost),
     )
 
 
-def _ig_profile(handle: str, cfg: AppConfig, job: Any) -> dict | None:
+def _ig_profile(handle: str, cfg: AppConfig, job: Any,
+                ghost: bool = False) -> dict | None:
     handle = handle.lstrip("@").strip("/")
-    page = _ig_fetch(f"https://www.instagram.com/{quote_plus(handle)}/", cfg)
+    page = _ig_fetch(f"https://www.instagram.com/{quote_plus(handle)}/", cfg, ghost)
     html = page.html_content
 
     if _ig_walled(page):
@@ -497,7 +535,7 @@ def _display_name(page) -> str:
 
 def scrape_instagram(
     *, job: Any, cfg: AppConfig, target: str, max_results: int = 40,
-    skip_known: bool = True,
+    skip_known: bool = True, ghost: bool = False,
 ) -> list[dict]:
     target = (target or "").strip()
     if not target:
@@ -506,7 +544,8 @@ def scrape_instagram(
     if target.startswith("#") or "explore/tags" in target:
         tag = target.lstrip("#").split("/")[-1].strip()
         job.report(message=f"Instagram hashtag #{tag}")
-        page = _ig_fetch(f"https://www.instagram.com/explore/tags/{quote_plus(tag)}/", cfg)
+        page = _ig_fetch(
+            f"https://www.instagram.com/explore/tags/{quote_plus(tag)}/", cfg, ghost)
         html = page.html_content
         if _ig_walled(page):
             raise LoginRequired(
@@ -539,7 +578,7 @@ def scrape_instagram(
             continue
 
         try:
-            lead = _ig_profile(handle, cfg, job)
+            lead = _ig_profile(handle, cfg, job, ghost)
             if lead:
                 leads.append(lead)
         except LoginRequired:
@@ -551,6 +590,10 @@ def scrape_instagram(
     hits = sum(1 for lead in leads if lead["email"])
     tail = f", {skipped} already in the vault" if skipped else ""
     job.report(message=f"{len(leads)} bios read, {hits} with an email{tail}")
+    announce(f"HUNT     Instagram '{target}': {len(leads)} bios, {hits} with an email",
+             killfeed.OK if hits else killfeed.WARN)
+    outpost.fire(outpost.HUNT_FINISHED, source="Instagram", query=target,
+                 found=len(leads), with_email=hits, skipped=skipped)
     return leads
 
 
@@ -573,7 +616,8 @@ def _tt_walled(page) -> bool:
             or "/login?redirect_url" in html[:4000])
 
 
-def _tt_profile(handle: str, cfg: AppConfig, job: Any) -> dict | None:
+def _tt_profile(handle: str, cfg: AppConfig, job: Any,
+                ghost: bool = False) -> dict | None:
     handle = handle.lstrip("@").strip("/")
     kwargs: dict[str, Any] = {
         "headless": cfg.headless,
@@ -583,6 +627,7 @@ def _tt_profile(handle: str, cfg: AppConfig, job: Any) -> dict | None:
     }
     if cfg.tiktok_profile_dir:
         kwargs["user_data_dir"] = cfg.tiktok_profile_dir
+    kwargs.update(stealth_kwargs(cfg, ghost))
 
     page = StealthyFetcher.fetch(f"https://www.tiktok.com/@{quote_plus(handle)}", **kwargs)
     if _tt_walled(page):
@@ -614,7 +659,7 @@ def _tt_profile(handle: str, cfg: AppConfig, job: Any) -> dict | None:
 
 def scrape_tiktok(
     *, job: Any, cfg: AppConfig, target: str, max_results: int = 40,
-    skip_known: bool = True,
+    skip_known: bool = True, ghost: bool = False,
 ) -> list[dict]:
     target = (target or "").strip()
     if not target:
@@ -631,6 +676,7 @@ def scrape_tiktok(
         }
         if cfg.tiktok_profile_dir:
             kwargs["user_data_dir"] = cfg.tiktok_profile_dir
+        kwargs.update(stealth_kwargs(cfg, ghost))
         page = StealthyFetcher.fetch(f"https://www.tiktok.com/tag/{quote_plus(tag)}", **kwargs)
         if _tt_walled(page):
             raise LoginRequired(TIKTOK_WALL_HINT)
@@ -662,7 +708,7 @@ def scrape_tiktok(
             continue
 
         try:
-            lead = _tt_profile(handle, cfg, job)
+            lead = _tt_profile(handle, cfg, job, ghost)
             if lead:
                 leads.append(lead)
         except LoginRequired:
@@ -674,6 +720,10 @@ def scrape_tiktok(
     hits = sum(1 for lead in leads if lead["email"])
     tail = f", {skipped} already in the vault" if skipped else ""
     job.report(message=f"{len(leads)} bios read, {hits} with an email{tail}")
+    announce(f"HUNT     TikTok '{target}': {len(leads)} bios, {hits} with an email",
+             killfeed.OK if hits else killfeed.WARN)
+    outpost.fire(outpost.HUNT_FINISHED, source="TikTok", query=target,
+                 found=len(leads), with_email=hits, skipped=skipped)
     return leads
 
 
@@ -747,7 +797,7 @@ def _parse_reddit_card(card) -> dict | None:
 
 def scrape_reddit(
     *, job: Any, cfg: AppConfig, target: str, max_results: int = 40,
-    skip_known: bool = True,
+    skip_known: bool = True, ghost: bool = False,
 ) -> list[dict]:
     """Public subreddit search for a niche keyword.
 
@@ -766,6 +816,7 @@ def scrape_reddit(
         timeout=max(cfg.request_timeout, 90000),
         network_idle=False,
         google_search=True,
+        **stealth_kwargs(cfg, ghost),
     )
     if _reddit_walled(page):
         raise LoginRequired(
@@ -810,6 +861,9 @@ def scrape_reddit(
 
     tail = f", {skipped} already in the vault" if skipped else ""
     job.report(message=f"{len(leads)} subreddits found{tail}")
+    announce(f"HUNT     Reddit '{keyword}': {len(leads)} communities", killfeed.OK)
+    outpost.fire(outpost.HUNT_FINISHED, source="Reddit", query=keyword,
+                 found=len(leads), skipped=skipped)
     return leads
 
 
@@ -879,7 +933,7 @@ def _parse_disboard_card(card) -> dict | None:
 
 def scrape_discord(
     *, job: Any, cfg: AppConfig, target: str, max_results: int = 40,
-    skip_known: bool = True,
+    skip_known: bool = True, ghost: bool = False,
 ) -> list[dict]:
     """Public Discord server directory search.
 
@@ -897,6 +951,7 @@ def scrape_discord(
         timeout=max(cfg.request_timeout, 90000),
         network_idle=False,
         google_search=True,
+        **stealth_kwargs(cfg, ghost),
     )
     if _discord_walled(page):
         raise LoginRequired(
@@ -939,4 +994,7 @@ def scrape_discord(
 
     tail = f", {skipped} already in the vault" if skipped else ""
     job.report(message=f"{len(leads)} Discord servers found{tail}")
+    announce(f"HUNT     Discord '{keyword}': {len(leads)} servers", killfeed.OK)
+    outpost.fire(outpost.HUNT_FINISHED, source="Discord", query=keyword,
+                 found=len(leads), skipped=skipped)
     return leads

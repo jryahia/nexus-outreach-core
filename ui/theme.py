@@ -55,6 +55,7 @@ INK = "#D8F6FF"
 
 VOID = "#020205"          # deep void black - the page floor
 ACTIVE = "#39FF88"        # engine firing - only ever shown while a job runs
+GHOST_RED = "#9B111E"     # Ghost Protocol - dried blood, not alarm red
 
 GLASS = "rgba(6, 13, 22, 0.62)"
 GLASS_STRONG = "rgba(3, 8, 14, 0.94)"
@@ -620,6 +621,128 @@ _CSS = f"""
       50% {{ opacity: 0.35; }}
   }}
 
+  /* ---- Kill-feed terminal ------------------------------------------------ */
+  /* Fed by a WebSocket, not by a rerun. It sits above the interface and below
+     the boot screen, and never takes a pointer event except on its own
+     scrollbar. */
+  #kill-feed {{
+      position: fixed;
+      left: 14px;
+      bottom: 92px;
+      width: 330px;
+      max-height: 232px;
+      overflow: hidden;
+      z-index: 4;
+      pointer-events: none;
+      font-family: {MONO_FONT};
+      font-size: 9.5px;
+      line-height: 1.75;
+      letter-spacing: 0.04em;
+      color: {ACCENT};
+      background: rgba(2, 7, 12, 0.55);
+      border: 1px solid rgba(0, 243, 255, 0.18);
+      border-left: 2px solid {ACCENT};
+      border-radius: 6px;
+      padding: 7px 9px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      /* Fades into nothing at the top, so old lines dissolve rather than
+         being clipped by a hard edge. */
+      mask-image: linear-gradient(180deg, transparent, #000 22%);
+      -webkit-mask-image: linear-gradient(180deg, transparent, #000 22%);
+      opacity: 0;
+      transition: opacity 0.4s {EASE};
+  }}
+  #kill-feed.live {{ opacity: 1; }}
+  #kill-feed .hd {{
+      color: {MUTED};
+      letter-spacing: 0.2em;
+      display: flex;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(0, 243, 255, 0.14);
+      padding-bottom: 3px;
+      margin-bottom: 4px;
+  }}
+  #kill-feed .ln {{
+      white-space: pre;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      animation: nx-feed-in 0.28s ease-out;
+  }}
+  #kill-feed .ln .ts {{ color: {MUTED}; }}
+  #kill-feed .ln.ok {{ color: {SUCCESS}; }}
+  #kill-feed .ln.warn {{ color: {WARNING}; }}
+  #kill-feed .ln.fail {{ color: {DANGER}; }}
+  #kill-feed .ln.fire {{ color: {ACTIVE}; text-shadow: 0 0 8px {ACTIVE}; }}
+  @keyframes nx-feed-in {{
+      from {{ opacity: 0; transform: translate3d(-6px, 0, 0); }}
+      to   {{ opacity: 1; transform: translate3d(0, 0, 0); }}
+  }}
+  @media (max-width: 1423px) {{ #kill-feed {{ display: none; }} }}
+
+  /* ---- Voice mute control ------------------------------------------------ */
+  /* The one element in the visor that accepts a click. Everything else there
+     is pointer-events:none so it can never intercept the interface. */
+  .nx-visor .mute {{
+      position: absolute;
+      right: 18px;
+      bottom: 92px;
+      pointer-events: auto;
+      cursor: pointer;
+      font-size: 9px;
+      letter-spacing: 0.18em;
+      padding: 5px 9px;
+      color: {ACCENT};
+      background: rgba(2, 7, 12, 0.6);
+      border: 1px solid rgba(0, 243, 255, 0.28);
+      border-radius: 4px;
+      user-select: none;
+      transition: color 0.2s {EASE}, border-color 0.2s {EASE};
+  }}
+  .nx-visor .mute:hover {{ border-color: {ACCENT}; }}
+  .nx-visor .mute.off {{ color: {MUTED}; border-color: rgba(255,255,255,0.14); }}
+  @media (max-width: 1423px) {{ .nx-visor .mute {{ display: none; }} }}
+
+  /* ---- Ghost Protocol: the system goes dark ------------------------------ */
+  /* Everything desaturates toward grey and the accents bleed to blood red.
+     Driven by a class on <html>, so one toggle repaints the whole surface
+     without touching a single component. */
+  .nx-ghost {{ --nx-ghost-accent: {GHOST_RED}; }}
+  .nx-ghost.nx-ghost .nx-visor,
+  .nx-ghost.nx-ghost .nx-visor .readout,
+  .nx-ghost.nx-ghost .nx-visor .rail {{ color: {GHOST_RED}; }}
+  .nx-ghost.nx-ghost .nx-visor .corner::before {{
+      border-color: {GHOST_RED};
+      box-shadow: 0 0 12px rgba(155, 17, 30, 0.5);
+  }}
+  .nx-ghost #kill-feed {{
+      color: {GHOST_RED};
+      border-color: rgba(155, 17, 30, 0.4);
+      border-left-color: {GHOST_RED};
+  }}
+  .nx-ghost.nx-ghost .nx-badge {{
+      color: {GHOST_RED};
+      border-color: rgba(155, 17, 30, 0.6);
+      background: rgba(155, 17, 30, 0.07);
+      box-shadow: 0 0 12px rgba(155, 17, 30, 0.28);
+  }}
+  .nx-ghost.nx-ghost .nx-badge .beacon {{
+      background: {GHOST_RED};
+      box-shadow: 0 0 12px {GHOST_RED};
+  }}
+  /* The interface itself dims and loses its colour. filter on one element is
+     a single composited pass, which is why this costs nothing. */
+  .nx-ghost .block-container {{
+      filter: grayscale(0.72) brightness(0.82);
+      border-color: rgba(155, 17, 30, 0.22);
+  }}
+  .nx-ghost canvas.nx-canvas {{ opacity: 0.32; }}
+  .nx-ghost .nx-crt {{
+      box-shadow:
+        inset 0 0 150px rgba(0, 0, 0, 0.8),
+        inset 0 0 30px rgba(155, 17, 30, 0.10);
+  }}
+
   /* ---- CRT curvature: the glass of the helmet ---------------------------- */
   /* Two things at once. The radial gradient darkens the corners the way a
      curved screen falls away from the eye, and the inset shadow fakes the
@@ -1071,6 +1194,7 @@ _CSS = f"""
       /* The controller checks the same query and never starts the canvas
          loop, but if it is already running this hides the result. */
       canvas.nx-canvas, canvas.nx-core, .nx-spot {{ display: none; }}
+      #kill-feed .ln {{ animation: none; }}
       .nx-boot {{ display: none; }}
       .nx-crt::after {{ display: none; }}
       div[data-testid="stMetric"], div[data-testid="stDataFrame"] {{
@@ -1276,7 +1400,7 @@ _HUD_JS = r"""
   // interacted with, so the context is created lazily on the first real
   // gesture rather than at load. Before that gesture every call here is a
   // silent no-op instead of an exception.
-  var audio = { ctx: null, hum: null, enabled: true, lastTick: 0 };
+  var audio = { ctx: null, hum: null, enabled: true, lastTick: 0, level: 1 };
 
   function audioCtx() {
     if (!audio.enabled) { return null; }
@@ -1298,7 +1422,7 @@ _HUD_JS = r"""
     // A short ramp in and an exponential tail out. A square wave switched on
     // at full gain clicks, and the click is louder than the note.
     gain.gain.setValueAtTime(0.0001, startAt);
-    gain.gain.exponentialRampToValueAtTime(peak, startAt + 0.006);
+    gain.gain.exponentialRampToValueAtTime(peak * audio.level, startAt + 0.006);
     gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
     osc.connect(gain);
     gain.connect(ctx.destination);
@@ -1338,7 +1462,8 @@ _HUD_JS = r"""
     if (!ctx || audio.hum) { return; }
     var gain = ctx.createGain();
     gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.03, ctx.currentTime + 0.8);
+    gain.gain.exponentialRampToValueAtTime(0.03 * audio.level,
+                                          ctx.currentTime + 0.8);
     var a = ctx.createOscillator();
     a.type = 'sine';
     a.frequency.value = 54;
@@ -1381,6 +1506,7 @@ _HUD_JS = r"""
   // The unlock gesture. Registered once, removed as soon as it fires.
   function unlockAudio() {
     audioCtx();
+    flushVoice();          // speak anything held back before the first gesture
     D.removeEventListener('pointerdown', unlockAudio);
     D.removeEventListener('keydown', unlockAudio);
   }
@@ -1549,7 +1675,11 @@ _HUD_JS = r"""
       root.classList.toggle('nx-lock', zoneCount >= 0);
       fpsLast = 0;   // force the readouts to repaint on the next frame
       // Only on acquisition, never on release or on a recount.
-      if (wasClear && zoneCount >= 0) { sfxLock(); }
+      if (wasClear && zoneCount >= 0) {
+        sfxLock();
+        say(zoneCount + (zoneCount === 1 ? " target acquired."
+                                         : " targets acquired."), 0.9, 0.5);
+      }
     }
   }
 
@@ -1634,6 +1764,200 @@ _HUD_JS = r"""
     core = null;
   }
 
+  /* ---- voice ------------------------------------------------------------- */
+  // SpeechSynthesis is native, so there is nothing to load and nothing to ship.
+  // Two things make it awkward and both are handled here rather than hoped
+  // over: the voice list is populated asynchronously on first access, and a
+  // browser will not speak before the page has been interacted with.
+  // Renamed from `voice` because that is already the oscillator builder
+  // above; the collision silently broke every sound effect.
+  var speech = { on: true, pick: null, queue: [], ready: false };
+
+  function pickVoice() {
+    if (!P.speechSynthesis) { return null; }
+    var all = P.speechSynthesis.getVoices() || [];
+    if (!all.length) { return null; }
+    // Prefer a deeper, more synthetic English voice where one exists, and
+    // fall back to whatever the platform offers rather than staying silent.
+    var wanted = ["Google UK English Male", "Microsoft George",
+                  "Microsoft Guy", "Daniel", "Alex", "Google US English"];
+    for (var w = 0; w < wanted.length; w++) {
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].name.indexOf(wanted[w]) === 0) { return all[i]; }
+      }
+    }
+    for (var j = 0; j < all.length; j++) {
+      if (/^en(-|_)/i.test(all[j].lang)) { return all[j]; }
+    }
+    return all[0];
+  }
+
+  function say(text, rate, pitch) {
+    if (!speech.on || !P.speechSynthesis || !text) { return; }
+    // Before the first gesture the browser silently drops the utterance, so
+    // it is held and spoken once the page has been touched.
+    if (!speech.ready) {
+      speech.queue.push([text, rate, pitch]);
+      if (speech.queue.length > 4) { speech.queue.shift(); }
+      return;
+    }
+    try {
+      var u = new P.SpeechSynthesisUtterance(text);
+      speech.pick = speech.pick || pickVoice();
+      if (speech.pick) { u.voice = speech.pick; }
+      u.rate = rate || 0.88;      // slower reads as deliberate, not sluggish
+      u.pitch = pitch || 0.55;    // low, for the machine register
+      u.volume = 0.95;
+      P.speechSynthesis.speak(u);
+    } catch (e) {}
+  }
+
+  function flushVoice() {
+    speech.ready = true;
+    var held = speech.queue.splice(0, speech.queue.length);
+    for (var i = 0; i < held.length; i++) {
+      say(held[i][0], held[i][1], held[i][2]);
+    }
+  }
+
+  if (P.speechSynthesis) {
+    // getVoices() is empty on the first call in most browsers.
+    P.speechSynthesis.addEventListener('voiceschanged', function () {
+      speech.pick = pickVoice();
+    });
+  }
+
+  function buildMute() {
+    if (!visor || visor.querySelector('.mute')) { return; }
+    var btn = D.createElement('div');
+    btn.className = 'mute';
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('tabindex', '0');
+    btn.textContent = 'VOICE ON';
+    function toggle() {
+      speech.on = !speech.on;
+      btn.textContent = speech.on ? 'VOICE ON' : 'VOICE OFF';
+      btn.classList.toggle('off', !speech.on);
+      if (!speech.on && P.speechSynthesis) {
+        try { P.speechSynthesis.cancel(); } catch (e) {}
+      } else {
+        say("Voice online.");
+      }
+      try { P.localStorage.setItem('nexusVoice', speech.on ? '1' : '0'); } catch (e) {}
+    }
+    btn.addEventListener('click', toggle);
+    btn.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
+    });
+    // The choice survives a reload, because being greeted by a voice you
+    // muted yesterday is the fastest way to hate a feature.
+    try {
+      if (P.localStorage.getItem('nexusVoice') === '0') {
+        speech.on = false;
+        btn.textContent = 'VOICE OFF';
+        btn.classList.add('off');
+      }
+    } catch (e) {}
+    visor.appendChild(btn);
+  }
+
+  /* ---- kill-feed --------------------------------------------------------- */
+  // A WebSocket straight to the engine. Streamlit's rerun cycle is not in the
+  // path at all: a line pushed from a campaign worker reaches this terminal in
+  // the time it takes a loopback socket to deliver a frame.
+  var feedEl = null, feedSock = null, feedRetry = 0, feedTimer = null;
+  var FEED_MAX_LINES = 60;
+
+  function buildFeed() {
+    if (D.getElementById('kill-feed')) { return; }
+    feedEl = D.createElement('div');
+    feedEl.id = 'kill-feed';
+    feedEl.setAttribute('aria-hidden', 'true');
+    var head = D.createElement('div');
+    head.className = 'hd';
+    head.innerHTML = '<span>KILL-FEED</span><span class="st">LINK DOWN</span>';
+    feedEl.appendChild(head);
+    D.body.appendChild(feedEl);
+  }
+
+  function feedStatus(text) {
+    if (!feedEl) { return; }
+    var st = feedEl.querySelector('.hd .st');
+    if (st) { st.textContent = text; }
+  }
+
+  function feedLine(entry) {
+    if (!feedEl) { return; }
+    var row = D.createElement('div');
+    row.className = 'ln ' + (entry.level || 'info');
+    row.innerHTML = '<span class="ts">' + entry.t + '</span> ' +
+                    String(entry.text).replace(/[<>&]/g, function (c) {
+                      return { '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c];
+                    });
+    feedEl.appendChild(row);
+    // Bounded. An all-night campaign would otherwise grow this node forever.
+    while (feedEl.childNodes.length > FEED_MAX_LINES + 1) {
+      feedEl.removeChild(feedEl.childNodes[1]);
+    }
+    feedEl.classList.add('live');
+    feedEl.scrollTop = feedEl.scrollHeight;
+  }
+
+  function connectFeed() {
+    var marker = D.querySelector('.nx-link-state[data-port]');
+    if (!marker || feedSock) { return; }
+    var port = marker.dataset.port, token = marker.dataset.token;
+    if (!port || !token) { return; }
+    buildFeed();
+    try {
+      feedSock = new P.WebSocket('ws://127.0.0.1:' + port + '/?token=' +
+                                 encodeURIComponent(token));
+    } catch (e) { feedSock = null; return; }
+
+    feedSock.onopen = function () {
+      feedRetry = 0;
+      feedStatus('LINK LIVE');
+      feedEl.classList.add('live');
+    };
+    feedSock.onmessage = function (ev) {
+      try { feedLine(JSON.parse(ev.data)); } catch (e) {}
+    };
+    feedSock.onclose = function () {
+      feedSock = null;
+      feedStatus('LINK DOWN');
+      // Backoff, capped. A tight reconnect loop against a server that is not
+      // coming back is worse than no feed at all.
+      feedRetry = Math.min(feedRetry + 1, 6);
+      feedTimer = P.setTimeout(connectFeed, 800 * feedRetry);
+    };
+    feedSock.onerror = function () { try { feedSock.close(); } catch (e) {} };
+  }
+
+  /* ---- ghost protocol ---------------------------------------------------- */
+  var ghost = false;
+
+  function readGhost() {
+    var on = !!D.querySelector('.nx-ghost-state');
+    if (on === ghost) { return; }
+    ghost = on;
+    root.classList.toggle('nx-ghost', ghost);
+    if (core) {
+      // The core loses its colour with everything else. The palette swap is
+      // picked up by the easing already running in renderCore.
+      core.calm.globe.setHex(ghost ? 0x9b111e : 0x00f3ff);
+      core.calm.halo.setHex(ghost ? 0x5a0d14 : 0xffaa00);
+      core.calm.dust.setHex(ghost ? 0x6b1520 : 0x00f3ff);
+    }
+    // Going dark means going quiet: the SFX drop to a whisper rather than off,
+    // so the interface still answers but stops announcing itself.
+    audio.level = ghost ? 0.25 : 1;
+    if (ghost) {
+      say("Ghost protocol engaged. Running dark.", 0.82, 0.42);
+    } else {
+      say("Ghost protocol disengaged.", 0.88, 0.55);
+    }
+  }
+
   /* ---- boot sequence ----------------------------------------------------- */
   // Runs once per page load. Streamlit reruns cannot replay it, because a
   // rerun remounts the component and the guard at the top of this file returns
@@ -1675,6 +1999,10 @@ _HUD_JS = r"""
       if (!bootEl) { return; }
       bootEl.classList.add('done');
       bootTimers.push(P.setTimeout(removeBoot, 700));
+      // Spoken after the panel snaps away, not over it. If the page has not
+      // been touched yet the browser will refuse, so say() holds the line and
+      // flushVoice speaks it on the first click instead.
+      say("Welcome back, Core Architect. System operational.", 0.86, 0.45);
     }, 2500));
   }
 
@@ -1947,6 +2275,8 @@ _HUD_JS = r"""
       decorate();
       pinLogs();
       readState();
+      readGhost();
+      connectFeed();
     });
   }
 
@@ -2000,6 +2330,19 @@ _HUD_JS = r"""
     // Audio first: a held oscillator survives every DOM teardown and would
     // keep humming over a page that no longer has a HUD.
     humStop();
+    if (P.speechSynthesis) { try { P.speechSynthesis.cancel(); } catch (e) {} }
+    speech.queue = [];
+    if (feedTimer) { P.clearTimeout(feedTimer); feedTimer = null; }
+    if (feedSock) {
+      // Drop the handler first: onclose would otherwise schedule a reconnect
+      // for a HUD that is being torn down.
+      feedSock.onclose = null;
+      try { feedSock.close(); } catch (e) {}
+      feedSock = null;
+    }
+    if (feedEl && feedEl.parentNode) { feedEl.remove(); }
+    feedEl = null;
+    root.classList.remove('nx-ghost');
     D.removeEventListener('mouseover', onHover);
     D.removeEventListener('pointerdown', unlockAudio);
     D.removeEventListener('keydown', unlockAudio);
@@ -2028,9 +2371,13 @@ _HUD_JS = r"""
     buildCrt();
     bootSequence();
     buildVisor();
+    buildMute();
+    buildFeed();
     decorate();
     pinLogs();
     readState();
+    readGhost();
+    connectFeed();
     observer = new P.MutationObserver(scheduleDecorate);
     observer.observe(D.body, { childList: true, subtree: true });
 
@@ -2059,7 +2406,13 @@ _HUD_JS = r"""
           tiltPanels: tiltCards.length,
           tilted: tiltCards.filter(function (c) { return c.tilted; }).length,
           audio: audio.ctx ? audio.ctx.state : 'not started',
+          audioLevel: audio.level,
           humming: !!audio.hum,
+          ghost: ghost,
+          voice: speech.on ? (speech.ready ? 'ready' : 'waiting for gesture')
+                           : 'muted',
+          feed: feedSock ? 'live' : 'down',
+          feedLines: feedEl ? Math.max(0, feedEl.childNodes.length - 1) : 0,
           booting: !!bootEl,
           globeColor: core ? '#' + core.globe.material.color.getHexString() : null,
           globeY: core ? +core.globe.rotation.y.toFixed(4) : null
@@ -2124,6 +2477,33 @@ def system_state(running: bool) -> None:
     """
     st.markdown(
         f'<div class="nx-state" data-state="{"running" if running else "idle"}"></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def link_state(port: int | None, token: str) -> None:
+    """Publish the kill-feed endpoint so the runtime can open the socket.
+
+    The token travels through the DOM rather than the page source because it is
+    minted per process: hard-coding it would mean it survived a restart, and a
+    long-lived token on a loopback port is the thing worth avoiding here.
+    """
+    if not port or not token:
+        return
+    st.markdown(
+        f'<div class="nx-link-state" data-port="{int(port)}" '
+        f'data-token="{html.escape(token)}"></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def ghost_state(active: bool, has_proxy: bool = False) -> None:
+    """Tell the runtime the system has gone dark, and how dark it really is."""
+    if not active:
+        return
+    st.markdown(
+        f'<div class="nx-ghost-state" data-proxy="{"1" if has_proxy else "0"}">'
+        f'</div>',
         unsafe_allow_html=True,
     )
 

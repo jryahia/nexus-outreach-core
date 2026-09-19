@@ -20,7 +20,8 @@ import streamlit as st
 from streamlit_agraph import Config, Edge, Node, agraph
 
 from core import (
-    cannon, diagnostics, geo, hunter, network, purifier, templates, vault,
+    cannon, diagnostics, geo, hunter, killfeed, network, outpost, purifier,
+    templates, vault,
 )
 from core.config import ENV_PATH, load_config
 from ui.state import DONE, ERROR, RUNNING, STOPPED, get_job, reset_job, start_job, stop_job
@@ -31,7 +32,9 @@ from ui.theme import (
     PLOT_SEQUENCE,
     SUCCESS,
     WARNING,
+    ghost_state,
     hud_runtime,
+    link_state,
     status_badge,
     system_state,
     zone_state,
@@ -46,6 +49,7 @@ from ui.theme import (
 HUNT = "hunt"
 CAMPAIGN = "campaign"
 DIAGNOSTIC = "diagnostic"
+GHOST = "ghost_protocol"
 
 st.set_page_config(
     page_title="NEXUS: Outreach Core",
@@ -60,6 +64,12 @@ apply_theme()
 hud_runtime()
 
 cfg = load_config()
+
+# The live terminal and the external webhook, started after the config exists.
+# Both are best-effort and both are idempotent, so a rerun re-runs these two
+# lines without opening a second socket or a second webhook worker.
+killfeed.start()
+outpost.configure(cfg.webhook_url, include_personal=cfg.webhook_detail)
 vault.init_db()          # idempotent: creates the schema and folds in legacy CSVs
 templates.ensure_defaults()
 
@@ -323,6 +333,31 @@ def tab_hunt() -> None:
         fn = hunter.scrape_instagram if source == "Instagram" else hunter.scrape_tiktok
         ready = bool(target)
 
+    ghost_col, _ = st.columns([3, 2])
+    with ghost_col:
+        ghost = st.toggle(
+            "ENGAGE GHOST PROTOCOL", key=GHOST,
+            help="Blocks the WebRTC local-address leak, drops images and fonts, "
+                 "and routes through NEXUS_PROXY when one is set.",
+        )
+    if ghost:
+        if cfg.has_proxy:
+            st.caption(
+                "Ghost Protocol engaged. WebRTC blocked, resources dropped, "
+                "traffic routed through the configured proxy."
+            )
+        else:
+            # The honest version. A button that says "going dark" while every
+            # request still leaves from this machine's own address would be
+            # worse than no button at all.
+            st.warning(
+                "Ghost Protocol engaged with no proxy set. WebRTC leaks are "
+                "blocked and the fingerprint is reduced, but requests still "
+                "leave from this machine's own IP address. Set NEXUS_PROXY "
+                "in .env for real cover.",
+                icon=":material/vpn_lock:",
+            )
+
     slider_col, toggle_col = st.columns([3, 2])
     max_results = slider_col.slider("Stop after", 10, 300, 40, step=10,
                                     help="Leads to collect.")
@@ -341,7 +376,7 @@ def tab_hunt() -> None:
     if st.button("START HUNTING", type="primary", width="stretch",
                  disabled=not ready, icon=":material/travel_explore:"):
         start_job(HUNT, fn, cfg=cfg, max_results=max_results,
-                  skip_known=skip_known, **args)
+                  skip_known=skip_known, ghost=bool(ghost), **args)
         st.rerun()
     if not ready:
         st.caption("Fill the fields above to enable the button.")
@@ -1228,6 +1263,11 @@ status_badge(
 # Resolved before any tab draws, so the radar, the CRM grid and the graph all
 # read one answer in the same rerun.
 st.session_state["_zone"] = resolve_zone()
+
+# Hands the runtime the socket details and the current stealth posture.
+_feed = killfeed.feed()
+link_state(_feed.port, _feed.token)
+ghost_state(st.session_state.get(GHOST, False), cfg.has_proxy)
 
 header("NEXUS: Outreach Core",
        "Acquire targets, purify the list, run the outreach. Local only.")

@@ -33,7 +33,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 from typing import Any
 
-from core import vault
+from core import killfeed, outpost, vault
 from core.config import AppConfig, SenderAccount
 from core.templates import Template
 
@@ -118,6 +118,8 @@ def _connect(cfg: AppConfig, sender: SenderAccount) -> smtplib.SMTP:
     ``cfg`` is still taken so the signature is stable for callers, and it
     supplies nothing about the transport any more.
     """
+    killfeed.push(f"DIAL     {sender.endpoint} ({sender.transport}) as {sender.email}",
+                  killfeed.INFO)
     context = ssl.create_default_context()
     if sender.use_ssl:
         server: smtplib.SMTP = smtplib.SMTP_SSL(
@@ -132,6 +134,7 @@ def _connect(cfg: AppConfig, sender: SenderAccount) -> smtplib.SMTP:
         server.starttls(context=context)
         server.ehlo()
     server.login(sender.email, sender.app_password)
+    killfeed.push(f"AUTH OK  {sender.email} on {sender.endpoint}", killfeed.OK)
     return server
 
 
@@ -267,6 +270,42 @@ def verify_all_senders(cfg: AppConfig) -> list[tuple[bool, str]]:
 # ---------------------------------------------------------------------------
 # Event log
 # ---------------------------------------------------------------------------
+# Status to feed level, so the terminal colours itself without the send loop
+# having to think about presentation.
+_FEED_LEVEL = {SENT: killfeed.OK, FAILED: killfeed.FAIL,
+               SKIPPED: killfeed.WARN, PREVIEW: killfeed.INFO}
+
+_WEBHOOK_EVENT = {SENT: outpost.EMAIL_SENT, FAILED: outpost.EMAIL_FAILED,
+                  SKIPPED: outpost.EMAIL_SKIPPED}
+
+
+def _narrate(row: dict) -> None:
+    """Push one send to the live terminal and the external webhook.
+
+    Both are deliberately best-effort. killfeed.push drops the line when no
+    browser is attached, and outpost.fire queues without waiting, so neither
+    can add latency to the gap between two emails or raise into the worker.
+    """
+    status = row.get("status", "")
+    address = row.get("email", "")
+    try:
+        killfeed.push(
+            f"{status.upper():<8} {address} via {row.get('sender', '-')}"
+            + (f" | {row['subject'][:60]}" if row.get("subject") else ""),
+            _FEED_LEVEL.get(status, killfeed.INFO))
+    except Exception:
+        pass
+    event = _WEBHOOK_EVENT.get(status)
+    if event:
+        try:
+            outpost.fire(event, campaign=row.get("campaign", ""),
+                         variant=row.get("variant", ""), status=status,
+                         email=address, subject=row.get("subject", ""),
+                         detail=row.get("detail", ""))
+        except Exception:
+            pass
+
+
 def log_event(job: Any, email: str, sender: str, status: str, subject: str = "",
               detail: str = "", variant: str = "", campaign: str = "") -> dict:
     """Record one send to job.rows (live table) and the vault (durable history).
@@ -287,6 +326,7 @@ def log_event(job: Any, email: str, sender: str, status: str, subject: str = "",
     }
     if job is not None:
         job.report(row=row)
+    _narrate(row)
     try:
         vault.log_event(row)
     except Exception as exc:
@@ -376,6 +416,10 @@ def send_campaign(
                message=("Dry run - nothing will be sent" if dry_run
                         else f"Starting campaign, {rotation}"))
     job.report(log=f"{len(queue)} leads, {rotation}{ab}")
+    killfeed.push(f"CAMPAIGN {campaign} armed: {len(queue)} leads, {rotation}",
+                  killfeed.FIRE)
+    outpost.fire(outpost.CAMPAIGN_STARTED, campaign=campaign, leads=len(queue),
+                 mailboxes=len(senders), dry_run=dry_run)
 
     if rotation_is_confounded(senders, variants):
         job.report(log=f"WARNING {len(senders)} mailboxes and {len(variants)} variants "
@@ -526,4 +570,11 @@ def send_campaign(
     verb = "previewed" if dry_run else "sent"
     tail = f", {stats['blocked']} skipped by the blacklist" if stats["blocked"] else ""
     job.report(message=f"{stats['sent']} {verb}, {stats['failed']} failed{tail}")
+    killfeed.push(
+        f"CAMPAIGN {campaign} complete: {stats['sent']} {verb}, "
+        f"{stats['failed']} failed, {stats['skipped']} skipped", killfeed.FIRE)
+    outpost.fire(outpost.CAMPAIGN_FINISHED, campaign=campaign,
+                 sent=stats["sent"], failed=stats["failed"],
+                 skipped=stats["skipped"], blocked=stats["blocked"],
+                 dry_run=dry_run)
     return stats
