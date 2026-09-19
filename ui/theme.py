@@ -794,6 +794,67 @@ _CSS = f"""
         inset 0 0 30px rgba(155, 17, 30, 0.10);
   }}
 
+  /* ---- Crosshair cursor --------------------------------------------------- */
+  /* A 24px reticle: thin ring, centre dot, four ticks. Inline SVG rather than
+     an asset, so it costs no request and inherits no cache. The hotspot is the
+     centre (12,12), which is the only sane choice for a crosshair - an offset
+     one makes every click feel like it landed somewhere else.
+     A custom cursor is a readability hazard as much as a flourish, so it is
+     scoped: anything you type into keeps its I-beam, anything you press keeps
+     its hand, and the data grid keeps its own. A crosshair over a text field
+     hides the caret, which is the fastest way to make an interface feel
+     broken. */
+  .stApp {{
+      cursor: url("data:image/svg+xml;utf8,\
+<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'>\
+<circle cx='12' cy='12' r='8' fill='none' stroke='%2300f3ff' stroke-width='1' opacity='0.85'/>\
+<circle cx='12' cy='12' r='1.6' fill='%2300f3ff'/>\
+<path d='M12 0v4M12 20v4M0 12h4M20 12h4' stroke='%2300f3ff' stroke-width='1' opacity='0.7'/>\
+</svg>") 12 12, crosshair;
+  }}
+  /* Typing surfaces keep the caret they need. */
+  .stApp input, .stApp textarea, .stApp [contenteditable="true"],
+  [data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"] {{
+      cursor: text;
+  }}
+  /* Anything pressable keeps the hand, so affordance survives the theme. */
+  .stApp button, .stApp a, .stApp select, .stApp summary,
+  .stApp [role="tab"], .stApp [role="option"], .stApp [role="button"],
+  [data-testid="stSlider"], [data-testid="stButtonGroup"] button,
+  .nx-visor .mute {{
+      cursor: pointer;
+  }}
+  /* The grid manages its own cursors for resizing and selection. */
+  [data-testid="stDataFrame"], [data-testid="stDataFrame"] * {{
+      cursor: auto;
+  }}
+
+  /* ---- Click pulse --------------------------------------------------------- */
+  /* A lock-on ring at the point of contact. Pure transform and opacity, so it
+     composites and never touches layout, and it removes itself when the
+     animation ends rather than accumulating a node per click. */
+  .nx-pulse-ring {{
+      position: fixed;
+      width: 18px;
+      height: 18px;
+      margin: -9px 0 0 -9px;
+      border: 1px solid {ACCENT};
+      border-radius: 50%;
+      pointer-events: none;
+      z-index: 999998;
+      opacity: 0.9;
+      box-shadow: 0 0 12px rgba(0, 243, 255, 0.55);
+      animation: nx-lockpulse 0.4s cubic-bezier(0.2, 0.7, 0.3, 1) forwards;
+  }}
+  @keyframes nx-lockpulse {{
+      from {{ transform: scale(0.35); opacity: 0.95; }}
+      to   {{ transform: scale(4.2);  opacity: 0; }}
+  }}
+  .nx-ghost .nx-pulse-ring {{
+      border-color: {GHOST_RED};
+      box-shadow: 0 0 12px rgba(155, 17, 30, 0.5);
+  }}
+
   /* ---- CRT curvature: the glass of the helmet ---------------------------- */
   /* Two things at once. The radial gradient darkens the corners the way a
      curved screen falls away from the eye, and the inset shadow fakes the
@@ -1250,6 +1311,8 @@ _CSS = f"""
          loop, but if it is already running this hides the result. */
       canvas.nx-canvas, canvas.nx-core, .nx-spot {{ display: none; }}
       #kill-feed .ln {{ animation: none; }}
+      .nx-pulse-ring {{ display: none; }}
+      .stApp {{ cursor: auto; }}
       .nx-boot {{ display: none; }}
       .nx-crt::after {{ display: none; }}
       div[data-testid="stMetric"], div[data-testid="stDataFrame"] {{
@@ -1567,6 +1630,42 @@ _HUD_JS = r"""
   }
   D.addEventListener('pointerdown', unlockAudio, { passive: true });
   D.addEventListener('keydown', unlockAudio, { passive: true });
+
+  // What the machine says when an action is launched. Short by design: a line
+  // that outlasts the click reads as a delay rather than as confirmation.
+  var ACTION_LINES = [
+    ["start hunting", "Scanning sectors."],
+    ["purify batch", "Purifying the list."],
+    ["launch dry run", "Rehearsal engaged. Nothing will be sent."],
+    ["launch campaign", "Outreach sequence engaged."],
+    ["draw the network", "Plotting the network."],
+  ];
+
+  function onActionSpeak(ev) {
+    var el = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+    if (!el) { return; }
+    // A Streamlit button with an icon renders that icon as a Material Symbols
+    // ligature inside its own label, so innerText arrives with the icon name
+    // on the first line and the caption on the last. Matching the raw string
+    // matches the icon name instead of the button.
+    var lines = (el.innerText || "").split(String.fromCharCode(10));
+    var label = "";
+    for (var n = lines.length - 1; n >= 0; n--) {
+      if (lines[n].trim()) { label = lines[n].trim().toLowerCase(); break; }
+    }
+    if (!label) { return; }
+    for (var i = 0; i < ACTION_LINES.length; i++) {
+      // startsWith, not includes: "launch campaign" would otherwise also match
+      // a button that merely mentions it, and the dry-run label starts with
+      // the same word as the live one.
+      if (label.indexOf(ACTION_LINES[i][0]) === 0) {
+        say(ACTION_LINES[i][1], 0.95, 0.5);
+        return;
+      }
+    }
+  }
+
+  D.addEventListener('click', onActionSpeak, true);
 
   // Hover blips, delegated from the document so controls that Streamlit
   // re-mounts on every rerun never need re-binding.
@@ -1916,6 +2015,39 @@ _HUD_JS = r"""
     visor.appendChild(btn);
   }
 
+  /* ---- click pulse -------------------------------------------------------- */
+  // Capture phase, so the ring appears even when a handler below stops the
+  // event. Bounded: a rapid clicker could otherwise queue rings faster than
+  // they retire, and each one is a composited layer.
+  var MAX_RINGS = 6;
+  var liveRings = 0;
+
+  function onClickPulse(ev) {
+    if (reduce || liveRings >= MAX_RINGS) { return; }
+    var ring = D.createElement('div');
+    ring.className = 'nx-pulse-ring';
+    ring.style.left = ev.clientX + 'px';
+    ring.style.top = ev.clientY + 'px';
+    liveRings++;
+    // Guarded: animationend and the fallback timeout can both fire for the
+    // same ring, and a double decrement drifts the counter down until the cap
+    // stops capping. Measured as a peak of seven against a limit of six.
+    var finished = false;
+    var done = function () {
+      if (finished) { return; }
+      finished = true;
+      liveRings--;
+      if (ring.parentNode) { ring.remove(); }
+    };
+    ring.addEventListener('animationend', done, { once: true });
+    // A belt for the brace: if the animation never fires - a background tab,
+    // a reduced-motion switch mid-flight - the node still goes.
+    P.setTimeout(done, 900);
+    D.body.appendChild(ring);
+  }
+
+  D.addEventListener('click', onClickPulse, true);
+
   /* ---- kill-feed --------------------------------------------------------- */
   // A WebSocket straight to the engine. Streamlit's rerun cycle is not in the
   // path at all: a line pushed from a campaign worker reaches this terminal in
@@ -2184,8 +2316,14 @@ _HUD_JS = r"""
           '\nCURSOR  ' + (haveMouse ? (mx | 0) + ',' + (my | 0) : 'IDLE');
       }
       if (readouts.br) {
+        // SECURE reports the two things that actually decide it: whether the
+        // operational feed is running over the token-gated loopback socket,
+        // and whether Ghost is routing. Anything else here would be a badge
+        // that says "secure" because someone typed it.
+        var secure = ghost ? 'GHOST' : (feedSock ? 'LINK' : 'LOCAL');
         readouts.br.textContent =
-          'NEXUS CORE\nOUTREACH ENGINE\n' + new Date().toTimeString().slice(0, 8);
+          'NEXUS CORE\nSECURE  ' + secure +
+          '\n' + new Date().toTimeString().slice(0, 8);
       }
     }
   }
@@ -2419,6 +2557,10 @@ _HUD_JS = r"""
     feedEl = null;
     root.classList.remove('nx-ghost');
     D.removeEventListener('mouseover', onHover);
+    D.removeEventListener('click', onClickPulse, true);
+    D.removeEventListener('click', onActionSpeak, true);
+    var strays = D.querySelectorAll('.nx-pulse-ring');
+    for (var r = 0; r < strays.length; r++) { strays[r].remove(); }
     D.removeEventListener('pointerdown', unlockAudio);
     D.removeEventListener('keydown', unlockAudio);
     if (audio.ctx) {
