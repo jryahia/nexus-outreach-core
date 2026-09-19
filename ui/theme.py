@@ -196,59 +196,35 @@ _CSS = f"""
       to   {{ transform: translate3d(0, 100vh, 0); }}
   }}
 
-  /* Content rides above both background layers. The central column is now a
-     single floating pane of glass with the 3D core visible through it. */
+  /* The container is a container. It carries no background, no border, no
+     frame and no transform.
+     Tilting it was a mistake and this is the record of why: a transform on the
+     column shrinks every pixel inside it, so the app pulled away from the
+     viewport edges and the black beyond it read as margin. The heavy drop
+     shadow then framed that gap, and the result was a sunken box rather than
+     a floating panel. Depth belongs on the cards, which are small enough to
+     float without the whole interface moving with them. */
   .block-container {{
       padding: 2.1rem 2.2rem 4rem 2.2rem;
       max-width: 1320px;
-      position: relative; z-index: 1;
-      background: rgba(2, 2, 5, 0.40);
-      backdrop-filter: blur(18px) saturate(125%);
-      -webkit-backdrop-filter: blur(18px) saturate(125%);
-      border: 1px solid rgba(0, 243, 255, 0.22);
-      border-radius: 18px;
-
-      /* The panel itself is tilted in space. A perspective on the parent only
-         affects children that carry their own 3D transform, which is why this
-         surface read as flat no matter how much depth the cards had: nothing
-         was ever rotating the panel. Angles are deliberately small - past
-         about three degrees the body text starts to shimmer on the subpixel
-         grid and the panel stops being readable, which is the opposite of
-         what a HUD is for. */
-      transform: perspective(2000px) rotateX(2deg) rotateY(-2deg) scale(0.97);
-      transform-origin: 50% 0%;
-
-      /* The frame. An outer cyan bloom to lift the sheet off the starfield, a
-         hairline inside it, and a long shadow underneath so the panel reads as
-         suspended rather than pasted on. */
-      box-shadow:
-        0 0 0 1px rgba(0, 243, 255, 0.10),
-        0 0 42px rgba(0, 243, 255, 0.16),
-        0 44px 120px rgba(0, 0, 0, 0.70),
-        inset 0 1px 0 rgba(0, 243, 255, 0.16),
-        inset 0 0 90px rgba(0, 243, 255, 0.035);
-
-      /* Establishes the depth field the cards tilt inside. */
+      position: relative;
+      z-index: 1;
+      background: transparent;
+      /* Still the depth field the cards tilt inside - perspective alone moves
+         nothing, it only gives the children something to rotate against. */
       perspective: 1400px;
       perspective-origin: 50% 40%;
   }}
-  /* A rotated panel can reach past the right edge of the document. Without
-     this the tilt buys a horizontal scrollbar, which is a high price for two
-     degrees. */
+  /* Kept from the reverted change: it costs nothing and stops a wide card or
+     a long readout from buying a horizontal scrollbar. */
   html, body, .stApp {{ overflow-x: hidden; }}
 
-  /* The glow is a second element so it can sit BEHIND the glass rather than
-     on top of the content, and so it never intercepts a pointer. */
-  .block-container::before {{
-      content: "";
-      position: absolute;
-      inset: -1px;
-      border-radius: inherit;
-      pointer-events: none;
-      background: linear-gradient(160deg,
-        rgba(0, 243, 255, 0.10), transparent 38%, transparent 72%,
-        rgba(255, 170, 0, 0.06));
-      z-index: 0;
+  /* Nothing sits between the background and the interface now, so text has to
+     hold its own against a moving starfield. A tight shadow does that without
+     putting a panel back. */
+  .block-container h1, .block-container h2, .block-container h3,
+  .block-container p, .block-container label, .nx-hero, .nx-section {{
+      text-shadow: 0 1px 12px rgba(0, 0, 0, 0.85);
   }}
 
   /* Holographic panels. The transform itself is written inline by the runtime
@@ -288,14 +264,18 @@ _CSS = f"""
   div[data-testid="stVerticalBlock"] > div {{ gap: 0.4rem; }}
 
   /* ---- Holographic panels ----------------------------------------------- */
+  /* The glass. Each card is its own pane with the core visible through it,
+     which is what produces depth without anything having to move. */
   div[data-testid="stMetric"],
   div[data-testid="metric-container"],
-  [data-testid="stExpander"],
+  div[data-testid="stExpander"],
   div[data-testid="stNotification"],
-  div[data-testid="stAlert"] {{
-      background: {GLASS};
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
+  div[data-testid="stAlert"],
+  .nx-badge,
+  [data-testid="stTabs"] [role="tablist"] {{
+      background: rgba(0, 15, 30, 0.40);
+      backdrop-filter: blur(12px) saturate(120%);
+      -webkit-backdrop-filter: blur(12px) saturate(120%);
       border: 1px solid {GLASS_EDGE};
       border-radius: 12px;
       box-shadow: {HOLO};
@@ -517,7 +497,7 @@ _CSS = f"""
   /* Border and glow only. The background stays opaque on purpose - the grid
      is virtualised and a blur behind it makes the rows look muddy. */
   div[data-testid="stDataFrame"], div[data-testid="stTable"] {{
-      background: {GLASS_STRONG};
+      background: rgba(0, 12, 24, 0.82);
       border: 1px solid {GLASS_EDGE};
       border-radius: 12px;
       box-shadow: {HOLO};
@@ -665,47 +645,60 @@ _CSS = f"""
   /* A command rail welded to the bottom edge of the viewport, full width.
      The previous version was a floating box parked over the middle of the
      page, which is exactly where the interface is. */
+  /* A side terminal, anchored bottom left. The full-width rail spanned the
+     window and detached from the layout the moment the page scrolled; a panel
+     of a fixed size, parked in a corner, has nothing to detach from. */
   #kill-feed {{
       position: fixed;
-      left: 0; right: 0; bottom: 0;
-      height: 0;                     /* collapsed until the first line lands */
-      max-height: 150px;
+      bottom: 20px;
+      left: 20px;
+      width: 450px;
+      max-height: 250px;
       overflow: hidden;
-      z-index: 6;
-      pointer-events: none;
+      z-index: 9999;
+      /* The panel accepts a hover so an idle feed can be brought back on
+         demand. Its contents stay inert, so nothing here is clickable. */
+      pointer-events: auto;
       font-family: {MONO_FONT};
       font-size: 11px;
-      line-height: 1.6;
-      letter-spacing: 0.06em;
+      line-height: 1.65;
+      letter-spacing: 0.04em;
       color: {ACCENT};
-      background: rgba(0, 5, 15, 0.80);
-      border-top: 1px solid {ACCENT};
-      box-shadow: 0 -2px 26px rgba(0, 243, 255, 0.22);
-      padding: 0 18px;
+      background: rgba(0, 10, 20, 0.85);
+      border: 1px solid rgba(0, 243, 255, 0.3);
+      border-left: 3px solid {ACCENT};
+      border-radius: 4px;
+      padding: 10px;
+      padding-top: 22px;            /* clears the label strip */
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
-      /* Newest at the bottom, older pushed up and out. column-reverse means
-         the rail scrolls upward on its own as lines arrive, with no scroll
+      /* Newest at the bottom, older pushed up and out of view. No scroll
          position to manage. */
       display: flex;
       flex-direction: column-reverse;
-      transition: height 0.35s {EASE}, opacity 0.35s {EASE};
+      transition: opacity 0.35s {EASE};
       opacity: 0;
   }}
-  #kill-feed.live {{ height: 150px; opacity: 1; padding: 8px 18px 10px 18px; }}
+  #kill-feed.live {{ opacity: 1; }}
+  /* Idle. A fixed panel in a corner will always sit over whatever else is in
+     that corner, so it steps back when it has nothing to report rather than
+     holding the space permanently. Any new line brings it straight back, and
+     hovering it recalls the history on demand. */
+  #kill-feed.idle {{ opacity: 0.16; }}
+  #kill-feed.idle:hover {{ opacity: 1; }}
 
-  /* The label sits in the corner of the rail rather than above it. */
   #kill-feed .hd {{
       position: absolute;
-      top: 6px; right: 18px;
+      top: 6px; left: 10px; right: 10px;
       color: {MUTED};
-      font-size: 9px;
+      font-size: 8.5px;
       letter-spacing: 0.24em;
       display: flex;
-      gap: 14px;
+      justify-content: space-between;
       pointer-events: none;
   }}
   #kill-feed .ln {{
+      pointer-events: none;
       white-space: pre;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -724,10 +717,9 @@ _CSS = f"""
       from {{ opacity: 0; transform: translate3d(0, 10px, 0); }}
       to   {{ opacity: 1; transform: translate3d(0, 0, 0); }}
   }}
-  /* While the rail is up the page gets its height back at the bottom, so the
-     last control on a tab is never sitting underneath it. */
-  .nx-feed-open .block-container {{ padding-bottom: 12rem; }}
-  @media (max-width: 900px) {{ #kill-feed {{ display: none; }} }}
+  /* The terminal floats clear of the column, so the page needs no allowance
+     for it. Hidden on narrow screens, where 450px is no longer "a corner". */
+  @media (max-width: 1100px) {{ #kill-feed {{ display: none; }} }}
 
   /* ---- Voice mute control ------------------------------------------------ */
   /* The one element in the visor that accepts a click. Everything else there
@@ -766,15 +758,8 @@ _CSS = f"""
   }}
   .nx-ghost #kill-feed {{
       color: {GHOST_RED};
-      border-top-color: {GHOST_RED};
-      box-shadow: 0 -2px 26px rgba(155, 17, 30, 0.28);
-  }}
-  .nx-ghost .block-container {{
-      box-shadow:
-        0 0 0 1px rgba(155, 17, 30, 0.14),
-        0 0 42px rgba(155, 17, 30, 0.14),
-        0 44px 120px rgba(0, 0, 0, 0.78),
-        inset 0 1px 0 rgba(155, 17, 30, 0.18);
+      border-color: rgba(155, 17, 30, 0.35);
+      border-left-color: {GHOST_RED};
   }}
   .nx-ghost.nx-ghost .nx-badge {{
       color: {GHOST_RED};
@@ -804,27 +789,31 @@ _CSS = f"""
      curved screen falls away from the eye, and the inset shadow fakes the
      bevel where that glass meets its housing. Both sit above the interface and
      neither can ever take a pointer event. */
+  /* The visor. Softened: the previous pass darkened the corners to 62% and
+     laid a 120px black inset over the whole frame, which dimmed the interface
+     it was supposed to sit in front of. A vignette should be felt at the very
+     edges and nowhere else. */
   .nx-crt {{
       position: fixed;
       inset: 0;
       z-index: 3;
       pointer-events: none;
       background:
-        radial-gradient(120% 120% at 50% 50%,
-          transparent 52%, rgba(0, 0, 0, 0.28) 82%, rgba(0, 0, 0, 0.62) 100%);
+        radial-gradient(135% 135% at 50% 50%,
+          transparent 68%, rgba(0, 0, 0, 0.10) 88%, rgba(0, 0, 0, 0.30) 100%);
       box-shadow:
-        inset 0 0 120px rgba(0, 0, 0, 0.55),
-        inset 0 0 24px rgba(0, 243, 255, 0.05);
+        inset 0 0 90px rgba(0, 0, 0, 0.22),
+        inset 0 0 20px rgba(0, 243, 255, 0.04);
   }}
-  /* The scanline film. Kept at a very low alpha - a CRT you notice is a CRT
-     that is in the way. */
+  /* The scanline film, at roughly a third of its old weight. A CRT you notice
+     is a CRT that is in the way. */
   .nx-crt::after {{
       content: "";
       position: absolute;
       inset: 0;
       background: repeating-linear-gradient(0deg,
-        rgba(0, 0, 0, 0.16) 0 1px, transparent 1px 3px);
-      opacity: 0.35;
+        rgba(0, 0, 0, 0.09) 0 1px, transparent 1px 4px);
+      opacity: 0.22;
   }}
 
   /* ---- Boot sequence ------------------------------------------------------ */
@@ -1922,7 +1911,9 @@ _HUD_JS = r"""
   // path at all: a line pushed from a campaign worker reaches this terminal in
   // the time it takes a loopback socket to deliver a frame.
   var feedEl = null, feedSock = null, feedRetry = 0, feedTimer = null;
+  var feedIdle = null;
   var FEED_MAX_LINES = 60;
+  var FEED_IDLE_MS = 20000;
 
   function buildFeed() {
     if (D.getElementById('kill-feed')) { return; }
@@ -1960,8 +1951,13 @@ _HUD_JS = r"""
       lines = feedEl.querySelectorAll('.ln');
     }
     feedEl.classList.add('live');
-    // Give the page its bottom margin back so the rail never covers a control.
-    root.classList.add('nx-feed-open');
+    feedEl.classList.remove('idle');
+    // A quiet spell means the campaign is between sends, so the terminal
+    // stands down until it has something to say again.
+    if (feedIdle) { P.clearTimeout(feedIdle); }
+    feedIdle = P.setTimeout(function () {
+      if (feedEl) { feedEl.classList.add('idle'); }
+    }, FEED_IDLE_MS);
   }
 
   function connectFeed() {
@@ -2394,6 +2390,7 @@ _HUD_JS = r"""
     if (P.speechSynthesis) { try { P.speechSynthesis.cancel(); } catch (e) {} }
     speech.queue = [];
     if (feedTimer) { P.clearTimeout(feedTimer); feedTimer = null; }
+    if (feedIdle) { P.clearTimeout(feedIdle); feedIdle = null; }
     if (feedSock) {
       // Drop the handler first: onclose would otherwise schedule a reconnect
       // for a HUD that is being torn down.
@@ -2403,7 +2400,6 @@ _HUD_JS = r"""
     }
     if (feedEl && feedEl.parentNode) { feedEl.remove(); }
     feedEl = null;
-    root.classList.remove('nx-feed-open');
     root.classList.remove('nx-ghost');
     D.removeEventListener('mouseover', onHover);
     D.removeEventListener('pointerdown', unlockAudio);
