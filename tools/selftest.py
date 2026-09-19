@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import random
 import sys
@@ -1059,6 +1060,22 @@ check("quarantined targets drop to a tenth of their alpha",
       f"{geo.DIMMED} vs {geo.CYAN}")
 check("an empty map still returns no layers",
       geo.map_layers([], [0], 400) == [])
+# Free roam. The default view deck.gl builds already says controller: true,
+# which reads as enough and is not - rotation stays behind a modifier key, so
+# a 60-degree camera cannot actually be swung around. Every gesture is named.
+_view = json.loads(geo.deck(_zone_pts).to_json())["views"][0]
+check("the deck ships an explicit MapView", _view["@@type"] == "MapView")
+_ctrl = _view["controller"]
+check("the controller is a gesture map, not a bare true",
+      isinstance(_ctrl, dict), str(_ctrl))
+for _gesture in ("dragPan", "dragRotate", "scrollZoom", "doubleClickZoom",
+                 "touchRotate", "keyboard"):
+    check(f"{_gesture} is enabled", _ctrl.get(_gesture) is True)
+check("the globe keeps turning after a drag", _ctrl.get("inertia", 0) > 0)
+check("free roam survives a zone selection",
+      json.loads(geo.deck(_zone_pts, [0], 400).to_json())["views"][0]
+      ["controller"]["dragRotate"] is True)
+
 check("the tilt survives a selection",
       geo.view_state(_zone_pts).pitch == 60
       and geo.view_state(_zone_pts).bearing == 30)

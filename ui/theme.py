@@ -203,15 +203,52 @@ _CSS = f"""
       max-width: 1320px;
       position: relative; z-index: 1;
       background: rgba(2, 2, 5, 0.40);
-      backdrop-filter: blur(15px) saturate(120%);
-      -webkit-backdrop-filter: blur(15px) saturate(120%);
-      border: 1px solid rgba(0, 243, 255, 0.10);
+      backdrop-filter: blur(18px) saturate(125%);
+      -webkit-backdrop-filter: blur(18px) saturate(125%);
+      border: 1px solid rgba(0, 243, 255, 0.22);
       border-radius: 18px;
-      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55),
-                  inset 0 1px 0 rgba(0, 243, 255, 0.08);
+
+      /* The panel itself is tilted in space. A perspective on the parent only
+         affects children that carry their own 3D transform, which is why this
+         surface read as flat no matter how much depth the cards had: nothing
+         was ever rotating the panel. Angles are deliberately small - past
+         about three degrees the body text starts to shimmer on the subpixel
+         grid and the panel stops being readable, which is the opposite of
+         what a HUD is for. */
+      transform: perspective(2000px) rotateX(2deg) rotateY(-2deg) scale(0.97);
+      transform-origin: 50% 0%;
+
+      /* The frame. An outer cyan bloom to lift the sheet off the starfield, a
+         hairline inside it, and a long shadow underneath so the panel reads as
+         suspended rather than pasted on. */
+      box-shadow:
+        0 0 0 1px rgba(0, 243, 255, 0.10),
+        0 0 42px rgba(0, 243, 255, 0.16),
+        0 44px 120px rgba(0, 0, 0, 0.70),
+        inset 0 1px 0 rgba(0, 243, 255, 0.16),
+        inset 0 0 90px rgba(0, 243, 255, 0.035);
+
       /* Establishes the depth field the cards tilt inside. */
       perspective: 1400px;
       perspective-origin: 50% 40%;
+  }}
+  /* A rotated panel can reach past the right edge of the document. Without
+     this the tilt buys a horizontal scrollbar, which is a high price for two
+     degrees. */
+  html, body, .stApp {{ overflow-x: hidden; }}
+
+  /* The glow is a second element so it can sit BEHIND the glass rather than
+     on top of the content, and so it never intercepts a pointer. */
+  .block-container::before {{
+      content: "";
+      position: absolute;
+      inset: -1px;
+      border-radius: inherit;
+      pointer-events: none;
+      background: linear-gradient(160deg,
+        rgba(0, 243, 255, 0.10), transparent 38%, transparent 72%,
+        rgba(255, 170, 0, 0.06));
+      z-index: 0;
   }}
 
   /* Holographic panels. The transform itself is written inline by the runtime
@@ -625,60 +662,72 @@ _CSS = f"""
   /* Fed by a WebSocket, not by a rerun. It sits above the interface and below
      the boot screen, and never takes a pointer event except on its own
      scrollbar. */
+  /* A command rail welded to the bottom edge of the viewport, full width.
+     The previous version was a floating box parked over the middle of the
+     page, which is exactly where the interface is. */
   #kill-feed {{
       position: fixed;
-      left: 14px;
-      bottom: 92px;
-      width: 330px;
-      max-height: 232px;
+      left: 0; right: 0; bottom: 0;
+      height: 0;                     /* collapsed until the first line lands */
+      max-height: 150px;
       overflow: hidden;
-      z-index: 4;
+      z-index: 6;
       pointer-events: none;
       font-family: {MONO_FONT};
-      font-size: 9.5px;
-      line-height: 1.75;
-      letter-spacing: 0.04em;
+      font-size: 11px;
+      line-height: 1.6;
+      letter-spacing: 0.06em;
       color: {ACCENT};
-      background: rgba(2, 7, 12, 0.55);
-      border: 1px solid rgba(0, 243, 255, 0.18);
-      border-left: 2px solid {ACCENT};
-      border-radius: 6px;
-      padding: 7px 9px;
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
-      /* Fades into nothing at the top, so old lines dissolve rather than
-         being clipped by a hard edge. */
-      mask-image: linear-gradient(180deg, transparent, #000 22%);
-      -webkit-mask-image: linear-gradient(180deg, transparent, #000 22%);
-      opacity: 0;
-      transition: opacity 0.4s {EASE};
-  }}
-  #kill-feed.live {{ opacity: 1; }}
-  #kill-feed .hd {{
-      color: {MUTED};
-      letter-spacing: 0.2em;
+      background: rgba(0, 5, 15, 0.80);
+      border-top: 1px solid {ACCENT};
+      box-shadow: 0 -2px 26px rgba(0, 243, 255, 0.22);
+      padding: 0 18px;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      /* Newest at the bottom, older pushed up and out. column-reverse means
+         the rail scrolls upward on its own as lines arrive, with no scroll
+         position to manage. */
       display: flex;
-      justify-content: space-between;
-      border-bottom: 1px solid rgba(0, 243, 255, 0.14);
-      padding-bottom: 3px;
-      margin-bottom: 4px;
+      flex-direction: column-reverse;
+      transition: height 0.35s {EASE}, opacity 0.35s {EASE};
+      opacity: 0;
+  }}
+  #kill-feed.live {{ height: 150px; opacity: 1; padding: 8px 18px 10px 18px; }}
+
+  /* The label sits in the corner of the rail rather than above it. */
+  #kill-feed .hd {{
+      position: absolute;
+      top: 6px; right: 18px;
+      color: {MUTED};
+      font-size: 9px;
+      letter-spacing: 0.24em;
+      display: flex;
+      gap: 14px;
+      pointer-events: none;
   }}
   #kill-feed .ln {{
       white-space: pre;
       overflow: hidden;
       text-overflow: ellipsis;
-      animation: nx-feed-in 0.28s ease-out;
+      /* The glow is what makes it read as a phosphor terminal rather than
+         grey text on a dark bar. */
+      text-shadow: 0 0 6px currentColor, 0 0 18px rgba(0, 243, 255, 0.28);
+      animation: nx-feed-in 0.3s ease-out;
   }}
-  #kill-feed .ln .ts {{ color: {MUTED}; }}
+  #kill-feed .ln .ts {{ color: {MUTED}; text-shadow: none; }}
   #kill-feed .ln.ok {{ color: {SUCCESS}; }}
   #kill-feed .ln.warn {{ color: {WARNING}; }}
   #kill-feed .ln.fail {{ color: {DANGER}; }}
-  #kill-feed .ln.fire {{ color: {ACTIVE}; text-shadow: 0 0 8px {ACTIVE}; }}
+  #kill-feed .ln.fire {{ color: {ACTIVE}; }}
+  /* Lines rise into place, which is the direction the rail reads in. */
   @keyframes nx-feed-in {{
-      from {{ opacity: 0; transform: translate3d(-6px, 0, 0); }}
+      from {{ opacity: 0; transform: translate3d(0, 10px, 0); }}
       to   {{ opacity: 1; transform: translate3d(0, 0, 0); }}
   }}
-  @media (max-width: 1423px) {{ #kill-feed {{ display: none; }} }}
+  /* While the rail is up the page gets its height back at the bottom, so the
+     last control on a tab is never sitting underneath it. */
+  .nx-feed-open .block-container {{ padding-bottom: 12rem; }}
+  @media (max-width: 900px) {{ #kill-feed {{ display: none; }} }}
 
   /* ---- Voice mute control ------------------------------------------------ */
   /* The one element in the visor that accepts a click. Everything else there
@@ -717,8 +766,15 @@ _CSS = f"""
   }}
   .nx-ghost #kill-feed {{
       color: {GHOST_RED};
-      border-color: rgba(155, 17, 30, 0.4);
-      border-left-color: {GHOST_RED};
+      border-top-color: {GHOST_RED};
+      box-shadow: 0 -2px 26px rgba(155, 17, 30, 0.28);
+  }}
+  .nx-ghost .block-container {{
+      box-shadow:
+        0 0 0 1px rgba(155, 17, 30, 0.14),
+        0 0 42px rgba(155, 17, 30, 0.14),
+        0 44px 120px rgba(0, 0, 0, 0.78),
+        inset 0 1px 0 rgba(155, 17, 30, 0.18);
   }}
   .nx-ghost.nx-ghost .nx-badge {{
       color: {GHOST_RED};
@@ -1875,7 +1931,7 @@ _HUD_JS = r"""
     feedEl.setAttribute('aria-hidden', 'true');
     var head = D.createElement('div');
     head.className = 'hd';
-    head.innerHTML = '<span>KILL-FEED</span><span class="st">LINK DOWN</span>';
+    head.innerHTML = '<span>NEXUS KILL-FEED</span><span class="st">LINK DOWN</span>';
     feedEl.appendChild(head);
     D.body.appendChild(feedEl);
   }
@@ -1894,13 +1950,18 @@ _HUD_JS = r"""
                     String(entry.text).replace(/[<>&]/g, function (c) {
                       return { '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c];
                     });
-    feedEl.appendChild(row);
+    // The rail is column-reverse, so the newest line goes in first and the
+    // stack grows upward on its own - no scroll position to chase.
+    feedEl.insertBefore(row, feedEl.firstChild);
     // Bounded. An all-night campaign would otherwise grow this node forever.
-    while (feedEl.childNodes.length > FEED_MAX_LINES + 1) {
-      feedEl.removeChild(feedEl.childNodes[1]);
+    var lines = feedEl.querySelectorAll('.ln');
+    while (lines.length > FEED_MAX_LINES) {
+      feedEl.removeChild(lines[lines.length - 1]);
+      lines = feedEl.querySelectorAll('.ln');
     }
     feedEl.classList.add('live');
-    feedEl.scrollTop = feedEl.scrollHeight;
+    // Give the page its bottom margin back so the rail never covers a control.
+    root.classList.add('nx-feed-open');
   }
 
   function connectFeed() {
@@ -2342,6 +2403,7 @@ _HUD_JS = r"""
     }
     if (feedEl && feedEl.parentNode) { feedEl.remove(); }
     feedEl = null;
+    root.classList.remove('nx-feed-open');
     root.classList.remove('nx-ghost');
     D.removeEventListener('mouseover', onHover);
     D.removeEventListener('pointerdown', unlockAudio);

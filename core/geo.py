@@ -456,6 +456,32 @@ def map_layers(points: list[dict], selected: list[int] | None = None,
     return layers
 
 
+# Free roam. pdk.Deck has no controller argument - the setting lives on the
+# View - and the default view deck.gl builds sets `controller: true`, which
+# sounds like enough and is not: with the bare default, rotation sits behind a
+# modifier key and the wheel is the only thing that feels connected. Every
+# gesture is therefore named, so a plain drag orbits the globe. That is the
+# whole point of holding the camera at sixty degrees.
+FREE_ROAM = {
+    "dragPan": True,
+    "dragRotate": True,      # plain drag orbits, no ctrl or right button
+    "scrollZoom": True,
+    "doubleClickZoom": True,
+    "touchZoom": True,
+    "touchRotate": True,
+    "keyboard": True,
+    "inertia": 300,          # the globe keeps turning after the drag ends
+}
+
+
+def map_view(controller=None):
+    """The MapView the deck renders through, with its gestures spelled out."""
+    import pydeck as pdk
+
+    return pdk.View(type="MapView",
+                    controller=FREE_ROAM if controller is None else controller)
+
+
 def deck(points: list[dict], selected: list[int] | None = None,
          radius_km: float = 0.0):
     """The whole map, ready for ``st.pydeck_chart``."""
@@ -464,6 +490,7 @@ def deck(points: list[dict], selected: list[int] | None = None,
     return pdk.Deck(
         layers=map_layers(points, selected, radius_km),
         initial_view_state=view_state(points),
+        views=[map_view()],
         map_style=CARTO_DARK_MATTER,
         tooltip={"text": "{city}\n{leads} leads, {emails} with an email\n{types}"},
     )
