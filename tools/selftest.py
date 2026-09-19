@@ -1843,6 +1843,76 @@ check("a tag found in live captions is queued and hunted",
       "dronefilming" in _seen_urls, str(_seen_urls))
 check("and its accounts reach the harvest", "second" in _h, str(_h))
 
+print("\ntag budget")
+check("a small hunt still gets a workable number of tags",
+      hunter.tag_budget(10) == hunter.MIN_SWEEP_TAGS, hunter.tag_budget(10))
+# The slider goes to 300. A flat budget would cap that at 14 pages and say
+# nothing about it.
+check("a big hunt is given a bigger budget",
+      hunter.tag_budget(300) > hunter.tag_budget(40),
+      f"{hunter.tag_budget(40)} -> {hunter.tag_budget(300)}")
+check("the budget is bounded at both ends",
+      hunter.tag_budget(100000) == hunter.MAX_SWEEP_TAGS)
+check("the budget rises with the ask, never falls",
+      all(hunter.tag_budget(n) <= hunter.tag_budget(n + 10)
+          for n in range(10, 400, 10)))
+
+
+def _endless(url):
+    """A tag page that always has one more tag to offer."""
+    tag = url.rstrip("/").rsplit("/", 1)[-1]
+    return type("P", (), {
+        "status": 200, "url": url,
+        "html_content": ('{"caption":{"text":"#drone' + tag[-4:] + 'x"},'
+                         '"username":"' + tag[:12] + '"}'),
+        "css": lambda self, sel: ["Tag"]})()
+
+
+_spender = _PacedJob()
+# Mining is rooted to the niche's own tags, so a long queue is what actually
+# reaches the budget - the same shape a wide expansion produces.
+_h, _w, _t = hunter._sweep_tags(
+    job=_spender, seed="drone", queries=[f"drone{n}" for n in range(90)],
+    max_results=300,
+    platform="Instagram", url_for=lambda q: f"https://x/{q}/", fetch=_endless,
+    walled=lambda page: False, handle_re=hunter._IG_USER_RE,
+    caption_re=hunter._IG_CAPTION_RE,
+)
+check("a sweep stops at its tag budget", _t == hunter.tag_budget(300), _t)
+_spent = [line for line in _spender.snapshot()["log"] if "budget spent" in line]
+check("and says so instead of returning a short list silently",
+      bool(_spent), _spent[:1])
+check("the log names both what was asked for and what was found",
+      bool(_spent) and "300" in _spent[0] and str(len(_h)) in _spent[0],
+      _spent[0] if _spent else "")
+
+_dry = _PacedJob()
+_h2, _, _t2 = hunter._sweep_tags(
+    job=_dry, seed="drone", queries=["drone"], max_results=300,
+    platform="Instagram", url_for=lambda q: f"https://x/{q}/",
+    fetch=lambda url: type("P", (), {
+        "status": 200, "url": url, "html_content": '{"username":"only"}',
+        "css": lambda self, sel: ["Tag"]})(),
+    walled=lambda page: False, handle_re=hunter._IG_USER_RE,
+    caption_re=hunter._IG_CAPTION_RE,
+)
+# Out of tags is a different answer from out of budget, and the operator acts
+# on them differently: one is "try a broader niche", the other "run it again".
+check("running out of tags is reported differently from running out of budget",
+      any("no further tags" in line for line in _dry.snapshot()["log"]),
+      str(_dry.snapshot()["log"][-1:]))
+
+_full = _PacedJob()
+_h3, _, _ = hunter._sweep_tags(
+    job=_full, seed="drone", queries=["drone"], max_results=1,
+    platform="Instagram", url_for=lambda q: f"https://x/{q}/", fetch=_endless,
+    walled=lambda page: False, handle_re=hunter._IG_USER_RE,
+    caption_re=hunter._IG_CAPTION_RE,
+)
+check("a hunt that filled its order explains nothing",
+      len(_h3) == 1 and not [line for line in _full.snapshot()["log"]
+                             if "budget spent" in line])
+
 
 for suffix in ("", "-wal", "-shm"):
     Path(str(TEST_DB) + suffix).unlink(missing_ok=True)

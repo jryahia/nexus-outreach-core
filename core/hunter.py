@@ -151,13 +151,29 @@ def scroll_until_stale(job: Any, rounds: int = 5,
 # the whole document instead would harvest the CSS palette: "#ffffff" is the
 # most common "hashtag" on an Instagram page by a factor of three.
 _IG_CAPTION_RE = re.compile(r'"caption"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"')
+# TikTok walls every anonymous visitor, so this field name is taken from its
+# JSON payload rather than confirmed against a live tag page. Mining simply
+# finds nothing if it is wrong, which costs the extra tags, not the hunt.
 _TT_CAPTION_RE = re.compile(r'"desc"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _HASHTAG_RE = re.compile(r"#([A-Za-z][A-Za-z0-9_]{3,29})")
 
-# How many tags one page contributes, and how many pages a whole sweep will
-# spend. Each is a page load, and a gated one buys nothing.
+# How many tags one page contributes, and the floor and ceiling on how many
+# pages a whole sweep will spend. Each is a page load, and a gated one buys
+# nothing, so the budget is a real cost - but a flat budget would silently cap
+# a 300-lead request at whatever 14 pages happened to return.
 MAX_MINED_TAGS = 4
-MAX_SWEEP_TAGS = 14
+MIN_SWEEP_TAGS = 14
+MAX_SWEEP_TAGS = 60
+
+
+def tag_budget(max_results: int) -> int:
+    """Tag pages worth spending on a request for this many leads.
+
+    A tag that is not gated returns about ten accounts, so the ask divided by
+    four leaves room for the gated ones without turning a small hunt into a
+    long one.
+    """
+    return max(MIN_SWEEP_TAGS, min(MAX_SWEEP_TAGS, max_results // 4))
 
 # Seconds to wait between tag pages. Six back-to-back loads from one
 # address is what the per-IP rate limit is watching for, and a gated tag
@@ -185,6 +201,9 @@ def mine_tags(html: str, seed: str, caption_re: re.Pattern,
             counts[tag] = counts.get(tag, 0) + 1
     counts.pop(seed.lower(), None)
 
+    # Split, not compacted: "real estate" has to match #realestatevideo and
+    # #realtorlife through "real" and "estate" separately. Compacting the seed
+    # here would narrow relatedness and let the drift control loosen.
     words = [w for w in re.split(r"[^a-z0-9]+", seed.lower()) if len(w) > 3]
 
     def rank(tag: str) -> tuple[int, int]:
@@ -209,6 +228,7 @@ def _sweep_tags(*, job: Any, seed: str, queries: list[str], max_results: int,
              f"{', '.join('#' + q for q in queries[:4])}"
              + (" ..." if len(queries) > 4 else ""), killfeed.INFO)
 
+    budget = tag_budget(max_results)
     pending = list(queries)
     # Only the niche's own tags are mined. Chaining one mined tag into the next
     # drifts: "video editor" reached #editor, then #editorial, then #makeup,
@@ -219,7 +239,7 @@ def _sweep_tags(*, job: Any, seed: str, queries: list[str], max_results: int,
     handles: list[str] = []
     walls = tried = 0
 
-    while (pending and len(handles) < max_results and tried < MAX_SWEEP_TAGS
+    while (pending and len(handles) < max_results and tried < budget
            and not job.cancelled):
         query = pending.pop(0)
         if query in seen_tags:
@@ -266,6 +286,18 @@ def _sweep_tags(*, job: Any, seed: str, queries: list[str], max_results: int,
         announce(f"HARVESTED {len(fresh):>3} profiles from {platform} #{query} "
                  f"({len(handles)} total)", killfeed.OK if fresh else killfeed.WARN)
 
+    # Never hand back a short list without saying why it is short. The
+    # operator asked for a number; anything less is a result they have to act
+    # on, not a detail.
+    if len(handles) < max_results and not job.cancelled:
+        if tried >= budget:
+            job.report(log=f"Tag budget spent: {tried} pages searched, "
+                           f"{len(handles)} of {max_results} leads found")
+            announce(f"BUDGET   {platform}: {tried} tag pages spent, "
+                     f"{len(handles)}/{max_results} found", killfeed.WARN)
+        elif not pending:
+            job.report(log=f"{platform} has no further tags to try for "
+                           f"'{seed}' - {len(handles)} of {max_results} found")
     return handles[:max_results], walls, tried
 
 
