@@ -213,22 +213,27 @@ _CSS = f"""
       perspective-origin: 50% 40%;
   }}
 
-  /* Holographic panels: a card lifts and tilts out of the glass toward the
-     viewer. transform only - no layout, no paint, composited. */
+  /* Holographic panels. The transform itself is written inline by the runtime
+     so each card can lean toward the actual cursor, which CSS alone cannot
+     express - there is no selector for "how far is the pointer from this
+     element's centre". A :hover rule here would win against nothing and lose
+     to the inline style, so the CSS only carries the easing and the hint.
+     The runtime clears the inline transform on exit, and this transition is
+     what makes that return smooth instead of a snap. */
   div[data-testid="stMetric"],
-  div[data-testid="metric-container"] {{
-      transform-style: preserve-3d;
-      transform: translateZ(0);
-  }}
-  div[data-testid="stMetric"]:hover,
-  div[data-testid="metric-container"]:hover {{
-      transform: translateY(-6px) translateZ(26px) rotateX(4deg);
-  }}
+  div[data-testid="metric-container"],
   div[data-testid="stDataFrame"] {{
-      transition: transform 0.35s {EASE};
+      transform-style: preserve-3d;
+      transition: transform 0.45s {EASE}, border-color 0.3s {EASE};
+      will-change: transform;
   }}
-  div[data-testid="stDataFrame"]:hover {{
-      transform: translateZ(14px);
+  /* While the cursor is over a card the runtime updates the tilt every frame,
+     so the easing has to get out of the way or every move would lag behind by
+     almost half a second. */
+  div[data-testid="stMetric"].nx-tilting,
+  div[data-testid="metric-container"].nx-tilting,
+  div[data-testid="stDataFrame"].nx-tilting {{
+      transition: none;
   }}
   /* This app renders no sidebar today (nothing calls st.sidebar), so this is
      insurance rather than styling: .stApp is transparent now, and a sidebar
@@ -615,6 +620,78 @@ _CSS = f"""
       50% {{ opacity: 0.35; }}
   }}
 
+  /* ---- CRT curvature: the glass of the helmet ---------------------------- */
+  /* Two things at once. The radial gradient darkens the corners the way a
+     curved screen falls away from the eye, and the inset shadow fakes the
+     bevel where that glass meets its housing. Both sit above the interface and
+     neither can ever take a pointer event. */
+  .nx-crt {{
+      position: fixed;
+      inset: 0;
+      z-index: 3;
+      pointer-events: none;
+      background:
+        radial-gradient(120% 120% at 50% 50%,
+          transparent 52%, rgba(0, 0, 0, 0.28) 82%, rgba(0, 0, 0, 0.62) 100%);
+      box-shadow:
+        inset 0 0 120px rgba(0, 0, 0, 0.55),
+        inset 0 0 24px rgba(0, 243, 255, 0.05);
+  }}
+  /* The scanline film. Kept at a very low alpha - a CRT you notice is a CRT
+     that is in the way. */
+  .nx-crt::after {{
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(0deg,
+        rgba(0, 0, 0, 0.16) 0 1px, transparent 1px 3px);
+      opacity: 0.35;
+  }}
+
+  /* ---- Boot sequence ------------------------------------------------------ */
+  .nx-boot {{
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      /* Never takes a click, even mid-animation: a boot screen that swallowed
+         the first click of a session would be a bug, not a flourish. */
+      pointer-events: none;
+      background: {VOID};
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: {MONO_FONT};
+      color: {ACCENT};
+      transform-origin: 50% 50%;
+  }}
+  .nx-boot .lines {{
+      font-size: 13px;
+      line-height: 2.1;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      text-shadow: 0 0 14px rgba(0, 243, 255, 0.55);
+      white-space: pre;
+      min-width: 32ch;
+  }}
+  .nx-boot .lines b {{ color: {SUCCESS}; font-weight: 400; }}
+  .nx-boot .caret {{
+      display: inline-block;
+      width: 8px; height: 1em;
+      background: {ACCENT};
+      vertical-align: text-bottom;
+      animation: nx-caret 0.9s steps(1, end) infinite;
+  }}
+  /* The snap: a fast scale past 1 with the opacity going first, so the panel
+     appears to be pulled off the screen rather than faded out behind it. */
+  .nx-boot.done {{
+      animation: nx-boot-snap 0.55s cubic-bezier(0.6, 0, 0.2, 1) forwards;
+  }}
+  @keyframes nx-boot-snap {{
+      0%   {{ transform: scale(1); opacity: 1; filter: blur(0); }}
+      45%  {{ transform: scale(1.04); opacity: 0.85; }}
+      100% {{ transform: scale(1.35); opacity: 0; filter: blur(6px); }}
+  }}
+
   /* ---- The visor: peripheral HUD overlays -------------------------------- */
   /* One fixed, non-interactive layer pinned to the viewport edges. It sits
      ABOVE the interface on z, but every part of it is pointer-events:none and
@@ -994,6 +1071,11 @@ _CSS = f"""
       /* The controller checks the same query and never starts the canvas
          loop, but if it is already running this hides the result. */
       canvas.nx-canvas, canvas.nx-core, .nx-spot {{ display: none; }}
+      .nx-boot {{ display: none; }}
+      .nx-crt::after {{ display: none; }}
+      div[data-testid="stMetric"], div[data-testid="stDataFrame"] {{
+          transform: none !important;
+      }}
       .nx-visor .readout, .nx-visor .rail .stream,
       .nx-visor .rail::after {{ animation: none; }}
       .nx-visor .rail {{ display: none; }}
@@ -1184,6 +1266,138 @@ _HUD_JS = r"""
     }
   }
 
+  /* ---- audio ------------------------------------------------------------- */
+  // Oscillators only - no files, no network, nothing to preload. Every voice
+  // is built, scheduled and thrown away, and each one disconnects itself in
+  // onended: an AudioNode that is never disconnected keeps its whole graph
+  // alive, and at one blip per hover that leak would be measured in thousands.
+  //
+  // A browser refuses to start an AudioContext until the page has been
+  // interacted with, so the context is created lazily on the first real
+  // gesture rather than at load. Before that gesture every call here is a
+  // silent no-op instead of an exception.
+  var audio = { ctx: null, hum: null, enabled: true, lastTick: 0 };
+
+  function audioCtx() {
+    if (!audio.enabled) { return null; }
+    if (!audio.ctx) {
+      var AC = P.AudioContext || P.webkitAudioContext;
+      if (!AC) { return null; }
+      try { audio.ctx = new AC(); } catch (e) { return null; }
+    }
+    if (audio.ctx.state === 'suspended') { audio.ctx.resume(); }
+    return audio.ctx;
+  }
+
+  function voice(freq, startAt, duration, peak, type) {
+    var ctx = audio.ctx;
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.setValueAtTime(freq, startAt);
+    // A short ramp in and an exponential tail out. A square wave switched on
+    // at full gain clicks, and the click is louder than the note.
+    gain.gain.setValueAtTime(0.0001, startAt);
+    gain.gain.exponentialRampToValueAtTime(peak, startAt + 0.006);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(startAt);
+    osc.stop(startAt + duration + 0.02);
+    osc.onended = function () {
+      try { osc.disconnect(); gain.disconnect(); } catch (e) {}
+    };
+  }
+
+  // A dry mechanical tick. Throttled: moving across a row of tabs fires
+  // mouseover repeatedly, and an un-throttled blip per event is a machine gun.
+  function sfxTick() {
+    var ctx = audioCtx();
+    if (!ctx) { return; }
+    var now = ctx.currentTime;
+    if (now - audio.lastTick < 0.06) { return; }
+    audio.lastTick = now;
+    voice(2100, now, 0.028, 0.018, 'square');
+  }
+
+  // Two tones a fifth apart, the second landing late enough to read as a
+  // confirmation rather than a chord.
+  function sfxLock() {
+    var ctx = audioCtx();
+    if (!ctx) { return; }
+    var now = ctx.currentTime;
+    voice(880, now, 0.10, 0.055, 'triangle');
+    voice(1320, now + 0.075, 0.16, 0.05, 'triangle');
+  }
+
+  // The overdrive bed: a low tone under a slower one, breathing through an
+  // LFO on the shared gain. Held open until stopped, so it is the one voice
+  // that has to be cleaned up by hand.
+  function humStart() {
+    var ctx = audioCtx();
+    if (!ctx || audio.hum) { return; }
+    var gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.03, ctx.currentTime + 0.8);
+    var a = ctx.createOscillator();
+    a.type = 'sine';
+    a.frequency.value = 54;
+    var b = ctx.createOscillator();
+    b.type = 'sine';
+    b.frequency.value = 81.5;      // a fifth up, for a beat rather than a drone
+    var lfo = ctx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.value = 0.7;
+    var lfoGain = ctx.createGain();
+    lfoGain.gain.value = 0.012;
+    lfo.connect(lfoGain);
+    lfoGain.connect(gain.gain);
+    a.connect(gain);
+    b.connect(gain);
+    gain.connect(ctx.destination);
+    a.start(); b.start(); lfo.start();
+    audio.hum = { gain: gain, nodes: [a, b, lfo, lfoGain] };
+  }
+
+  function humStop() {
+    if (!audio.hum || !audio.ctx) { return; }
+    var ctx = audio.ctx;
+    var held = audio.hum;
+    audio.hum = null;
+    try {
+      held.gain.gain.cancelScheduledValues(ctx.currentTime);
+      held.gain.gain.setValueAtTime(held.gain.gain.value || 0.03, ctx.currentTime);
+      held.gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.5);
+    } catch (e) {}
+    P.setTimeout(function () {
+      for (var i = 0; i < held.nodes.length; i++) {
+        try { held.nodes[i].stop(); } catch (e) {}
+        try { held.nodes[i].disconnect(); } catch (e) {}
+      }
+      try { held.gain.disconnect(); } catch (e) {}
+    }, 620);
+  }
+
+  // The unlock gesture. Registered once, removed as soon as it fires.
+  function unlockAudio() {
+    audioCtx();
+    D.removeEventListener('pointerdown', unlockAudio);
+    D.removeEventListener('keydown', unlockAudio);
+  }
+  D.addEventListener('pointerdown', unlockAudio, { passive: true });
+  D.addEventListener('keydown', unlockAudio, { passive: true });
+
+  // Hover blips, delegated from the document so controls that Streamlit
+  // re-mounts on every rerun never need re-binding.
+  function onHover(ev) {
+    var el = ev.target;
+    if (!el || !el.closest) { return; }
+    if (el.closest('button, [data-testid="stTab"], [role="tab"], a')) {
+      sfxTick();
+    }
+  }
+  D.addEventListener('mouseover', onHover, { passive: true });
+
   /* ---- the WebGL core ---------------------------------------------------- */
   // Three.js is pulled from the CDN into the PARENT head, once. If the network
   // is not there the promise simply never resolves into a scene: the 2D
@@ -1262,6 +1476,20 @@ _HUD_JS = r"""
       positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta) * 0.55;
       positions[i * 3 + 2] = r * Math.cos(phi);
     }
+    // Spherical coordinates are kept alongside the flat position buffer so
+    // the stream can be pushed outward by advancing one number per particle
+    // instead of recomputing a direction every frame.
+    var radii = new Float32Array(COUNT);
+    var thetas = new Float32Array(COUNT);
+    var phis = new Float32Array(COUNT);
+    for (var j = 0; j < COUNT; j++) {
+      var px = positions[j * 3], py = positions[j * 3 + 1] / 0.55,
+          pz = positions[j * 3 + 2];
+      radii[j] = Math.sqrt(px * px + py * py + pz * pz);
+      thetas[j] = Math.atan2(py, px);
+      phis[j] = Math.acos(Math.max(-1, Math.min(1, pz / (radii[j] || 1))));
+    }
+
     var dustGeo = new THREE.BufferGeometry();
     dustGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     var dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
@@ -1271,7 +1499,15 @@ _HUD_JS = r"""
     scene.add(dust);
 
     core = { renderer: renderer, scene: scene, camera: camera, canvas: canvas,
-             globe: globe, halo: halo, dust: dust, THREE: THREE };
+             globe: globe, halo: halo, dust: dust, THREE: THREE,
+             positions: positions, radii: radii, thetas: thetas, phis: phis,
+             count: COUNT,
+             calm: { globe: new THREE.Color(0x00f3ff),
+                     halo: new THREE.Color(0xffaa00),
+                     dust: new THREE.Color(0x00f3ff) },
+             fire: { globe: new THREE.Color(0xff2e63),
+                     halo: new THREE.Color(0xffaa00),
+                     dust: new THREE.Color(0xff7a2e) } };
     sizeCore();
   }
 
@@ -1297,6 +1533,8 @@ _HUD_JS = r"""
     if (now !== active) {
       active = now;
       root.classList.toggle('nx-active', active);
+      // The overdrive bed follows the engine, not the click that started it.
+      if (active) { humStart(); } else { humStop(); }
     }
 
     // The count is read off the marker's dataset rather than counted in JS:
@@ -1306,9 +1544,12 @@ _HUD_JS = r"""
     var next = zone ? parseInt(zone.dataset.count, 10) : -1;
     if (isNaN(next)) { next = -1; }
     if (next !== zoneCount) {
+      var wasClear = zoneCount < 0;
       zoneCount = next;
       root.classList.toggle('nx-lock', zoneCount >= 0);
       fpsLast = 0;   // force the readouts to repaint on the next frame
+      // Only on acquisition, never on release or on a recount.
+      if (wasClear && zoneCount >= 0) { sfxLock(); }
     }
   }
 
@@ -1317,6 +1558,7 @@ _HUD_JS = r"""
 
   var coreLast = 0;
   var CORE_INTERVAL = 33;   // ms: the core draws at ~30fps, the rest at 60
+  var burst = 0;            // eased 0..1 outward speed of the data stream
 
   function renderCore(t) {
     if (!core) { return; }
@@ -1347,6 +1589,33 @@ _HUD_JS = r"""
     core.halo.rotation.z += step * 0.00005;
     core.dust.rotation.y += step * 0.000022;
 
+    // Live fire: the core goes to alert colour and the stream fires outward.
+    // Colours are eased rather than switched so the change reads as the system
+    // spinning up, and the lerp is cheap enough to run unconditionally.
+    var target = active ? core.fire : core.calm;
+    core.globe.material.color.lerp(target.globe, 0.05);
+    core.halo.material.color.lerp(target.halo, 0.05);
+    core.dust.material.color.lerp(target.dust, 0.05);
+    core.globe.material.opacity += ((active ? 0.42 : 0.20)
+                                    - core.globe.material.opacity) * 0.05;
+
+    if (active || burst > 0.002) {
+      // Ease the outward speed in and out so stopping a campaign settles the
+      // field instead of freezing it mid-flight.
+      burst += ((active ? 1 : 0) - burst) * 0.04;
+      var speed = burst * 0.26;
+      var pos = core.positions, r = core.radii, th = core.thetas, ph = core.phis;
+      for (var i = 0; i < core.count; i++) {
+        r[i] += speed;
+        if (r[i] > 26) { r[i] = 7.5; }        // respawn at the core
+        var sinPhi = Math.sin(ph[i]);
+        pos[i * 3]     = r[i] * sinPhi * Math.cos(th[i]);
+        pos[i * 3 + 1] = r[i] * sinPhi * Math.sin(th[i]) * 0.55;
+        pos[i * 3 + 2] = r[i] * Math.cos(ph[i]);
+      }
+      core.dust.geometry.attributes.position.needsUpdate = true;
+    }
+
     core.renderer.render(core.scene, core.camera);
   }
 
@@ -1363,6 +1632,63 @@ _HUD_JS = r"""
       if (core.canvas && core.canvas.parentNode) { core.canvas.remove(); }
     } catch (e) {}
     core = null;
+  }
+
+  /* ---- boot sequence ----------------------------------------------------- */
+  // Runs once per page load. Streamlit reruns cannot replay it, because a
+  // rerun remounts the component and the guard at the top of this file returns
+  // before reaching here.
+  var BOOT_LINES = [
+    "NEXUS OS // KERNEL BOOT",
+    "ESTABLISHING SATELLITE UPLINK",
+    "ENCRYPTING CONNECTION",
+    "READY."
+  ];
+
+  var bootEl = null;
+  var bootTimers = [];
+
+  function bootSequence() {
+    if (reduce) { return; }        // motion is off: skip straight to the app
+    bootEl = D.createElement('div');
+    bootEl.className = 'nx-boot';
+    bootEl.setAttribute('aria-hidden', 'true');
+    var lines = D.createElement('div');
+    lines.className = 'lines';
+    bootEl.appendChild(lines);
+    D.body.appendChild(bootEl);
+
+    var shown = [];
+    BOOT_LINES.forEach(function (line, i) {
+      bootTimers.push(P.setTimeout(function () {
+        var done = i === BOOT_LINES.length - 1;
+        shown.push((done ? "<b>> " : "> ") + line + (done ? "</b>" : ""));
+        lines.innerHTML = shown.join("\n") +
+                          (done ? "" : '\n<span class="caret"></span>');
+        sfxTick();
+      }, 120 + i * 480));
+    });
+
+    // Snap away at 2.5s, gone from the DOM once the animation ends so it can
+    // never sit invisibly over the interface.
+    bootTimers.push(P.setTimeout(function () {
+      if (!bootEl) { return; }
+      bootEl.classList.add('done');
+      bootTimers.push(P.setTimeout(removeBoot, 700));
+    }, 2500));
+  }
+
+  function removeBoot() {
+    if (bootEl && bootEl.parentNode) { bootEl.remove(); }
+    bootEl = null;
+  }
+
+  function buildCrt() {
+    if (D.querySelector('.nx-crt')) { return; }
+    var crt = D.createElement('div');
+    crt.className = 'nx-crt';
+    crt.setAttribute('aria-hidden', 'true');
+    D.body.appendChild(crt);
   }
 
   /* ---- the visor --------------------------------------------------------- */
@@ -1470,6 +1796,10 @@ _HUD_JS = r"""
   var spotCards = [];
   var rectsDirty = true;
 
+  // Every panel that leans toward the cursor. The metric cards also carry a
+  // spotlight layer; the data grids only tilt.
+  var tiltCards = [];
+
   function refreshRects() {
     var cards = D.querySelectorAll('[data-testid="stMetric"]');
     spotCards = [];
@@ -1478,6 +1808,14 @@ _HUD_JS = r"""
       if (!layer) { continue; }
       var r = cards[i].getBoundingClientRect();
       spotCards.push({ el: cards[i], layer: layer, r: r });
+    }
+
+    var panels = D.querySelectorAll('[data-testid="stMetric"], '
+                                    + '[data-testid="stDataFrame"]');
+    tiltCards = [];
+    for (var k = 0; k < panels.length; k++) {
+      tiltCards.push({ el: panels[k], r: panels[k].getBoundingClientRect(),
+                       tilted: false });
     }
     rectsDirty = false;
   }
@@ -1503,6 +1841,46 @@ _HUD_JS = r"""
         // the cursor moved, is cheaper than the bookkeeping to avoid them.
         c.layer.style.setProperty('--spot-a', '0');
       }
+    }
+  }
+
+  var TILT_MAX = 7;        // degrees at the far corner
+  var TILT_LIFT = 18;      // px toward the viewer
+
+  // Written once per frame from cached rects. A rect read here would force
+  // layout on every panel on every mouse move, which is the difference
+  // between a tilt that feels physical and one that feels like a stutter.
+  function updateTilt() {
+    for (var i = 0; i < tiltCards.length; i++) {
+      var c = tiltCards[i], r = c.r;
+      if (!r.width || !r.height) { continue; }
+      var inside = haveMouse && mx >= r.left && mx <= r.right &&
+                   my >= r.top && my <= r.bottom;
+      if (inside) {
+        // -1..1 from the centre, so the card leans away from the cursor on the
+        // far edge and toward it on the near one.
+        var dx = (mx - (r.left + r.width / 2)) / (r.width / 2);
+        var dy = (my - (r.top + r.height / 2)) / (r.height / 2);
+        if (!c.tilted) { c.el.classList.add('nx-tilting'); c.tilted = true; }
+        c.el.style.transform =
+          'perspective(1000px) rotateX(' + (-dy * TILT_MAX).toFixed(2) +
+          'deg) rotateY(' + (dx * TILT_MAX).toFixed(2) +
+          'deg) translateZ(' + TILT_LIFT + 'px)';
+      } else if (c.tilted) {
+        // Hand the card back to CSS, which carries the easing that makes the
+        // return smooth rather than a snap.
+        c.tilted = false;
+        c.el.classList.remove('nx-tilting');
+        c.el.style.transform = '';
+      }
+    }
+  }
+
+  function clearTilt() {
+    for (var i = 0; i < tiltCards.length; i++) {
+      tiltCards[i].el.classList.remove('nx-tilting');
+      tiltCards[i].el.style.transform = '';
+      tiltCards[i].tilted = false;
     }
   }
 
@@ -1585,6 +1963,7 @@ _HUD_JS = r"""
       root.style.setProperty('--mouse-x', mx + 'px');
       root.style.setProperty('--mouse-y', my + 'px');
       updateSpots();
+      updateTilt();
       mouseDirty = false;
     }
     drawNetwork();
@@ -1618,6 +1997,22 @@ _HUD_JS = r"""
     P.removeEventListener('resize', onResize);
     P.removeEventListener('resize', onCanvasResize);
     disposeCore();
+    // Audio first: a held oscillator survives every DOM teardown and would
+    // keep humming over a page that no longer has a HUD.
+    humStop();
+    D.removeEventListener('mouseover', onHover);
+    D.removeEventListener('pointerdown', unlockAudio);
+    D.removeEventListener('keydown', unlockAudio);
+    if (audio.ctx) {
+      try { audio.ctx.close(); } catch (e) {}
+      audio.ctx = null;
+    }
+    for (var b = 0; b < bootTimers.length; b++) { P.clearTimeout(bootTimers[b]); }
+    bootTimers = [];
+    removeBoot();
+    var crt = D.querySelector('.nx-crt');
+    if (crt) { crt.remove(); }
+    clearTilt();
     root.classList.remove('nx-active');
     root.classList.remove('nx-lock');
     if (visor && visor.parentNode) { visor.remove(); }
@@ -1630,6 +2025,8 @@ _HUD_JS = r"""
 
   function start() {
     if (!buildCanvas()) { return; }
+    buildCrt();
+    bootSequence();
     buildVisor();
     decorate();
     pinLogs();
@@ -1656,10 +2053,23 @@ _HUD_JS = r"""
         return {
           active: active,
           spin: +spin.toFixed(3),
+          burst: +burst.toFixed(3),
           core: !!core,
           nodes: nodes.length,
+          tiltPanels: tiltCards.length,
+          tilted: tiltCards.filter(function (c) { return c.tilted; }).length,
+          audio: audio.ctx ? audio.ctx.state : 'not started',
+          humming: !!audio.hum,
+          booting: !!bootEl,
+          globeColor: core ? '#' + core.globe.material.color.getHexString() : null,
           globeY: core ? +core.globe.rotation.y.toFixed(4) : null
         };
+      },
+      // Lets the operator silence the console without touching the code.
+      audio: function (on) {
+        audio.enabled = on !== false;
+        if (!audio.enabled) { humStop(); }
+        return audio.enabled;
       }
     };
   }
