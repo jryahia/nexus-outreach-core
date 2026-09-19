@@ -292,6 +292,9 @@ class AppConfig:
     request_timeout: int = 30000
     tiktok_profile_dir: str = ""
     ig_profile_dir: str = ""
+    # Apollo.io. A licensed B2B data source reached over its official REST API;
+    # treated as a credential, never printed.
+    apollo_api_key: str = ""
     # Ghost Protocol. A proxy string Scrapling understands, or "" for none.
     proxy: str = ""
     solve_challenges: bool = True
@@ -302,6 +305,10 @@ class AppConfig:
     @property
     def has_proxy(self) -> bool:
         return bool(self.proxy.strip())
+
+    @property
+    def has_apollo(self) -> bool:
+        return bool(self.apollo_api_key.strip())
 
     @property
     def proxies(self) -> list[str]:
@@ -387,4 +394,5 @@ def load_config(refresh: bool = True) -> AppConfig:
         webhook_detail=_bool("NEXUS_WEBHOOK_DETAIL", False),
         tiktok_profile_dir=os.getenv("TIKTOK_PROFILE_DIR", "").strip(),
         ig_profile_dir=os.getenv("IG_PROFILE_DIR", "").strip(),
+        apollo_api_key=os.getenv("APOLLO_API_KEY", "").strip(),
     )

@@ -310,6 +310,29 @@ def tab_hunt() -> None:
         args = {"keyword": keyword, "location": location}
         fn = hunter.scrape_google_maps
         ready = bool(keyword and location)
+    elif source in hunter.API_SOURCES:
+        # Apollo is a licensed REST source: a job title plus industry keywords,
+        # not a hashtag, and no browser to run Ghost Protocol against.
+        left, right = st.columns(2)
+        title = left.text_input(
+            "Job title", placeholder="Founder, Creative Director",
+            help="One or more titles, comma-separated.")
+        keyword = right.text_input(
+            "Industry or keywords", placeholder="video production")
+        args = {"title": title, "keyword": keyword}
+        fn = hunter.scrape_apollo
+        ready = bool(title or keyword)
+        if cfg.has_apollo:
+            st.caption(
+                "Apollo session: key loaded. Results are pulled over the "
+                "official API, deduplicated, and MX-checked before they land."
+            )
+        else:
+            st.warning(
+                "Apollo session: no key. Add APOLLO_API_KEY to .env - it is "
+                "your licensed account, not a bypass.",
+                icon=":material/key_off:",
+            )
     elif source in hunter.KEYWORD_SOURCES:
         # Reddit and Discord search a niche, not an account. They return
         # communities rather than people: intelligence for the vault and the
@@ -344,13 +367,17 @@ def tab_hunt() -> None:
             st.caption("Sweeping " + str(len(variants)) + " hashtags: "
                        + ", ".join("#" + v for v in variants))
 
-    ghost_col, _ = st.columns([3, 2])
-    with ghost_col:
-        ghost = st.toggle(
-            "ENGAGE GHOST PROTOCOL", key=GHOST,
-            help="Blocks the WebRTC local-address leak, drops images and fonts, "
-                 "and routes through NEXUS_PROXY when one is set.",
-        )
+    # Ghost Protocol is a browser posture. An API source has no browser, so the
+    # toggle is hidden rather than shown as a control that would do nothing.
+    ghost = False
+    if source not in hunter.API_SOURCES:
+        ghost_col, _ = st.columns([3, 2])
+        with ghost_col:
+            ghost = st.toggle(
+                "ENGAGE GHOST PROTOCOL", key=GHOST,
+                help="Blocks the WebRTC local-address leak, drops images and "
+                     "fonts, and routes through NEXUS_PROXY when one is set.",
+            )
     if ghost:
         if cfg.has_proxy:
             st.caption(

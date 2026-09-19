@@ -20,7 +20,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 
 from scrapling.fetchers import Fetcher, StealthyFetcher
 
-from core import enrich, killfeed, outpost, vault
+from core import apollo, enrich, killfeed, outpost, vault, verify
 from core.config import AppConfig
 from core.purifier import (
     LEAD_FIELDS,
@@ -31,16 +31,20 @@ from core.purifier import (
 )
 
 __all__ = [
-    "LEAD_FIELDS", "SOURCES", "KEYWORD_SOURCES", "LoginRequired",
+    "LEAD_FIELDS", "SOURCES", "KEYWORD_SOURCES", "API_SOURCES", "LoginRequired",
     "scrape_google_maps", "scrape_instagram", "scrape_tiktok",
-    "scrape_reddit", "scrape_discord",
+    "scrape_reddit", "scrape_discord", "scrape_apollo",
 ]
 
-SOURCES = ("Google Maps", "Instagram", "TikTok", "Reddit", "Discord")
+SOURCES = ("Google Maps", "Instagram", "TikTok", "Reddit", "Discord", "Apollo")
 
 # Sources driven by a plain keyword rather than a handle or a hashtag. The Hunt
 # tab branches on this instead of hard-coding source names.
 KEYWORD_SOURCES = ("Reddit", "Discord")
+
+# Sources that pull from a licensed REST API rather than a browser. They take a
+# job title plus keywords, not a hashtag, and never touch Ghost Protocol.
+API_SOURCES = ("Apollo",)
 
 # Default test query, per the brief.
 DEFAULT_MAPS_KEYWORD = "Video production agency"
@@ -1561,5 +1565,124 @@ def scrape_discord(
     job.report(message=f"{len(leads)} Discord servers found{tail}")
     announce(f"HUNT     Discord '{keyword}': {len(leads)} servers", killfeed.OK)
     outpost.fire(outpost.HUNT_FINISHED, source="Discord", query=keyword,
+                 found=len(leads), skipped=skipped)
+    return leads
+
+
+# ---------------------------------------------------------------------------
+# Apollo.io - licensed B2B data over the official REST API
+# ---------------------------------------------------------------------------
+def scrape_apollo(
+    *, job: Any, cfg: AppConfig, title: str = "", keyword: str = "",
+    max_results: int = 40, skip_known: bool = True, ghost: bool = False,
+) -> list[dict]:
+    """Ingest people from Apollo.io by job title and industry keywords.
+
+    A sanctioned source: Apollo is a licensed, opt-in database reached through
+    its published REST API, so there is no page to scrape and no wall to slip
+    past. The work here is paging the API, mapping each record into the vault
+    schema, and passing every lead through the same dedup and MX gates the
+    browser scrapers use.
+
+    ``ghost`` is accepted because the Hunt tab sends it to every source, and
+    ignored because an API call has no browser to harden or proxy to route.
+    """
+    title = (title or "").strip()
+    keyword = (keyword or "").strip()
+    if not (title or keyword):
+        job.report(message="Enter a job title or keywords to search Apollo")
+        return []
+
+    if not cfg.has_apollo:
+        announce("APOLLO KEY: MISSING", killfeed.WARN)
+        raise LoginRequired(
+            "APOLLO_API_KEY is not set. Add it to .env - Apollo is a licensed "
+            "source, so the key is your account, not a bypass."
+        )
+    announce("APOLLO KEY: LOADED", killfeed.OK)
+
+    query_label = " / ".join(part for part in (title, keyword) if part)
+    known = load_known(skip_known, job)
+    leads: list[dict] = []
+    seen_handles: set[str] = set()
+    skipped = dropped = 0
+    page = 1
+
+    while len(leads) < max_results and page <= apollo.MAX_PAGES and not job.cancelled:
+        job.report(message=f"Apollo: page {page} for '{query_label}'")
+        try:
+            payload = apollo.search_people(
+                api_key=cfg.apollo_api_key, title=title, keywords=keyword,
+                page=page, per_page=apollo.MAX_PER_PAGE,
+                timeout=max(cfg.request_timeout / 1000, 15),
+            )
+        except apollo.AuthError as exc:
+            announce("APOLLO KEY: REJECTED", killfeed.WARN)
+            raise LoginRequired(str(exc))
+        except apollo.ApolloError as exc:
+            job.report(log=f"Apollo request stopped: {exc}")
+            announce(f"APOLLO   halted: {exc}", killfeed.WARN)
+            break
+
+        records = apollo.people(payload)
+        if not records:
+            break
+
+        page_new = 0
+        for person in records:
+            if len(leads) >= max_results:
+                break
+            mapped = apollo.map_person(person)
+
+            # Dedup within the run on the LinkedIn URL, then against the vault.
+            key = vault.norm_handle(mapped.get("handle", "")) or \
+                (mapped.get("email") or "").lower()
+            if key and key in seen_handles:
+                continue
+            if key:
+                seen_handles.add(key)
+
+            match = vault.match_known(mapped, known)
+            if match:
+                skipped += 1
+                job.report(log=f"{SKIPPED_NOTE}: {mapped['name']} ({match})")
+                continue
+
+            # Same MX gate as the sender: drop only a definitively dead domain,
+            # keep transient failures so a flaky resolver never bins a lead.
+            email = mapped.get("email", "")
+            if email and not verify.deliverable(email):
+                dropped += 1
+                job.report(log=f"Dropped {email} | {verify.DROP_REASON}")
+                mapped["email"] = ""
+
+            lead = _blank_lead("Apollo")
+            lead.update({k: mapped.get(k, "") for k in LEAD_FIELDS})
+            lead["source"] = "Apollo"
+            lead["lead_type"] = classify_lead(
+                name=lead["name"], bio=mapped.get("category", ""),
+                category=mapped.get("category", ""), source="Apollo")
+            leads.append(lead)
+            page_new += 1
+
+        with_email = sum(1 for lead in leads if lead["email"])
+        job.report(total=max_results, current=len(leads),
+                   message=f"Apollo: {len(leads)} leads ({with_email} with email)")
+        announce(f"APOLLO API: Ingested {len(leads)} verified leads for "
+                 f"'{query_label}'", killfeed.OK if page_new else killfeed.WARN)
+
+        if not apollo.has_more(payload, page, apollo.MAX_PER_PAGE):
+            break
+        page += 1
+
+    tail = []
+    if skipped:
+        tail.append(f"{skipped} already in the vault")
+    if dropped:
+        tail.append(f"{dropped} emails failed the MX gate")
+    suffix = f" ({', '.join(tail)})" if tail else ""
+    job.report(message=f"{len(leads)} Apollo leads for '{query_label}'{suffix}")
+    announce(f"HUNT     Apollo '{query_label}': {len(leads)} leads", killfeed.OK)
+    outpost.fire(outpost.HUNT_FINISHED, source="Apollo", query=query_label,
                  found=len(leads), skipped=skipped)
     return leads

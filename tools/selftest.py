@@ -1293,7 +1293,8 @@ check("a configured proxy reaches the fetcher",
 check("has_proxy reflects the config",
       _proxied.has_proxy is True and _plain.has_proxy is False)
 for _fn in (hunter.scrape_google_maps, hunter.scrape_instagram,
-            hunter.scrape_tiktok, hunter.scrape_reddit, hunter.scrape_discord):
+            hunter.scrape_tiktok, hunter.scrape_reddit, hunter.scrape_discord,
+            hunter.scrape_apollo):
     check(f"{_fn.__name__} accepts the stealth posture",
           "ghost" in inspect.signature(_fn).parameters)
 
@@ -1478,10 +1479,15 @@ for _name, _fn in (("scrape_google_maps", hunter.scrape_google_maps),
                    ("scrape_instagram", hunter.scrape_instagram),
                    ("scrape_tiktok", hunter.scrape_tiktok),
                    ("scrape_reddit", hunter.scrape_reddit),
-                   ("scrape_discord", hunter.scrape_discord)):
+                   ("scrape_discord", hunter.scrape_discord),
+                   ("scrape_apollo", hunter.scrape_apollo)):
     _p = inspect.signature(_fn).parameters
-    _args = {"keyword": "k", "location": "l"} if _name == "scrape_google_maps" \
-        else {"target": "t"}
+    if _name == "scrape_google_maps":
+        _args = {"keyword": "k", "location": "l"}
+    elif _name == "scrape_apollo":
+        _args = {"title": "t", "keyword": "k"}
+    else:
+        _args = {"target": "t"}
     try:
         inspect.signature(_fn).bind(job=None, cfg=None, max_results=10,
                                     skip_known=True, **_args)
@@ -1504,6 +1510,15 @@ check("a keyword in the blurb outranks the source default",
 check("blank keyword returns nothing, offline",
       hunter.scrape_reddit(job=Job(key="t"), cfg=cfg, target="  ") == []
       and hunter.scrape_discord(job=Job(key="t"), cfg=cfg, target="") == [])
+
+print("\nApollo source registry")
+check("Apollo is a selectable source", "Apollo" in hunter.SOURCES, str(hunter.SOURCES))
+check("Apollo is registered as an API source, not a browser one",
+      hunter.API_SOURCES == ("Apollo",)
+      and "Apollo" not in hunter.KEYWORD_SOURCES)
+# Empty inputs must cost zero API calls, the same guarantee the scrapers give.
+check("blank title and keyword return nothing without a request",
+      hunter.scrape_apollo(job=Job(key="t"), cfg=cfg, title="", keyword="  ") == [])
 
 # ---------------------------------------------------------------------------
 print("\nsmart query expansion")
@@ -1913,6 +1928,184 @@ check("a hunt that filled its order explains nothing",
       len(_h3) == 1 and not [line for line in _full.snapshot()["log"]
                              if "budget spent" in line])
 
+
+# ---------------------------------------------------------------------------
+print("\nApollo request shape")
+import dataclasses  # noqa: E402
+from core import apollo  # noqa: E402
+
+_url, _headers, _body_bytes = apollo.build_request(
+    api_key="secret-key", title="Video Editor, Creative Director",
+    keywords="video production", page=2, per_page=250)
+_body = json.loads(_body_bytes.decode("utf-8"))
+check("the search hits the mixed_people endpoint",
+      _url == apollo.SEARCH_URL and "mixed_people/search" in _url)
+check("the api key rides in the header, not the body",
+      _headers.get(apollo.API_KEY_HEADER) == "secret-key"
+      and "api_key" not in _body and "secret-key" not in _body_bytes.decode(),
+      apollo.API_KEY_HEADER)
+check("a comma-separated title becomes a list of titles",
+      _body["person_titles"] == ["Video Editor", "Creative Director"],
+      str(_body.get("person_titles")))
+check("keywords ride as q_keywords", _body["q_keywords"] == "video production")
+check("per_page is clamped to the API maximum",
+      _body["per_page"] == apollo.MAX_PER_PAGE, _body["per_page"])
+check("the page number is carried through", _body["page"] == 2)
+
+print("\nApollo record mapping")
+_person = {
+    "first_name": "Ana", "last_name": "Rossi", "title": "Creative Director",
+    "email": "ana@studio.com", "email_status": "verified",
+    "linkedin_url": "https://www.linkedin.com/in/anarossi",
+    "city": "Milan", "state": "", "country": "Italy",
+    "organization": {"name": "Rossi Studio", "website_url": "https://rossi.studio",
+                     "primary_phone": {"number": "+39 02 123"}},
+}
+_mapped = apollo.map_person(_person)
+check("first and last name are joined", _mapped["name"] == "Ana Rossi")
+check("title and company become the readable category",
+      _mapped["category"] == "Creative Director @ Rossi Studio")
+check("the org website is the lead's website",
+      _mapped["website"] == "https://rossi.studio")
+check("the org phone is flattened out of its object",
+      _mapped["phone"] == "+39 02 123")
+check("the LinkedIn URL is the dedup handle",
+      _mapped["handle"] == "https://www.linkedin.com/in/anarossi")
+check("city and country make the location", _mapped["location"] == "Milan, Italy")
+
+# The failure that would actually corrupt the vault: Apollo hands back a
+# placeholder when a plan has not unlocked the email. It must never be stored.
+check("a locked placeholder email is dropped, not stored",
+      apollo.map_person({"name": "X", "email": "email_not_unlocked@domain.com",
+                         "email_status": "verified"})["email"] == "")
+check("an explicit locked status is honoured too",
+      apollo.map_person({"name": "X", "email": "real@looks.com",
+                         "email_status": "locked"})["email"] == "")
+check("a genuine address survives", _mapped["email"] == "ana@studio.com")
+
+print("\nApollo ingestion (mocked transport, zero network)")
+
+
+def _apollo_pages(*pages):
+    """A transport that serves canned pages and counts the calls made."""
+    calls = {"n": 0, "auth": []}
+
+    def post(url, *, headers, body, timeout):
+        calls["auth"].append(headers.get(apollo.API_KEY_HEADER))
+        index = min(calls["n"], len(pages) - 1)
+        calls["n"] += 1
+        return 200, json.dumps(pages[index]).encode("utf-8")
+
+    post.calls = calls
+    return post
+
+
+def _record(handle, email="", status="verified", org="Acme", site="acme.com"):
+    return {"name": handle.title(), "email": email, "email_status": status,
+            "title": "Video Editor",
+            "linkedin_url": f"https://www.linkedin.com/in/{handle}",
+            "organization": {"name": org, "website_url": f"https://{site}"}}
+
+
+_apollo_cfg = dataclasses.replace(cfg, apollo_api_key="live-key-123")
+_real_post = apollo._post
+try:
+    # Two pages, one duplicate handle across them: dedup must collapse it.
+    # total_pages is what a real multi-page response carries; the worker
+    # trusts it rather than guessing from a short record count.
+    _page1 = {"people": [_record("ana", "ana@example.com"),
+                         _record("bob", "bob@example.com")],
+              "pagination": {"page": 1, "per_page": 100, "total_entries": 3,
+                             "total_pages": 2}}
+    _page2 = {"people": [_record("bob", "bob@example.com"),   # duplicate
+                         _record("cara", "cara@example.com")],
+              "pagination": {"page": 2, "per_page": 100, "total_entries": 3,
+                             "total_pages": 2}}
+    # total_pages is 2, so ingestion must stop after page 2 without a 3rd call.
+    _t = _apollo_pages(_page1, _page2, {"people": []})
+    apollo.configure(post=_t)
+    _leads = hunter.scrape_apollo(job=Job(key="a"), cfg=_apollo_cfg,
+                                  title="Video Editor", keyword="video",
+                                  max_results=40, skip_known=False)
+    _names = sorted(lead["name"] for lead in _leads)
+    check("every unique person is ingested", _names == ["Ana", "Bob", "Cara"], str(_names))
+    check("a duplicate LinkedIn URL is collapsed across pages",
+          [lead["name"] for lead in _leads].count("Bob") == 1)
+    check("the source is stamped Apollo",
+          all(lead["source"] == "Apollo" for lead in _leads))
+    check("each lead is classified, not left blank",
+          all(lead["lead_type"] for lead in _leads))
+    check("the key travelled on every request header",
+          _t.calls["auth"] == ["live-key-123"] * _t.calls["n"], str(_t.calls["auth"]))
+    check("a short page ends ingestion without another call",
+          _t.calls["n"] == 2, _t.calls["n"])
+
+    # The cap is a budget on API credits: it must stop paging, not just trim.
+    _big = {"people": [_record(f"u{i}", f"u{i}@example.com") for i in range(100)],
+            "pagination": {"page": 1, "per_page": 100, "total_entries": 5000,
+                           "total_pages": 50}}
+    _t = _apollo_pages(_big, _big, _big)
+    apollo.configure(post=_t)
+    _capped = hunter.scrape_apollo(job=Job(key="a"), cfg=_apollo_cfg,
+                                   title="Video Editor", keyword="", max_results=30,
+                                   skip_known=False)
+    check("ingestion stops at the requested cap", len(_capped) == 30, len(_capped))
+    check("the cap stops paging, it does not fetch everything",
+          _t.calls["n"] == 1, _t.calls["n"])
+
+    # A missing key is a setup problem, surfaced like the other login walls.
+    _raised = ""
+    try:
+        hunter.scrape_apollo(job=Job(key="a"),
+                             cfg=dataclasses.replace(cfg, apollo_api_key=""),
+                             title="Video Editor", keyword="", max_results=10)
+    except hunter.LoginRequired as exc:
+        _raised = str(exc)
+    check("a missing API key is reported, with the .env fix named",
+          "APOLLO_API_KEY" in _raised, _raised[:48])
+
+    # A rejected key (401) must not look like an empty result set.
+    def _reject(url, *, headers, body, timeout):
+        return 401, b'{"error":"unauthorized"}'
+    apollo.configure(post=_reject)
+    _raised = ""
+    try:
+        hunter.scrape_apollo(job=Job(key="a"), cfg=_apollo_cfg,
+                             title="Video Editor", keyword="", max_results=10)
+    except hunter.LoginRequired as exc:
+        _raised = str(exc)
+    check("a rejected key raises rather than returning nothing silently",
+          "key" in _raised.lower(), _raised[:48])
+
+    # The MX gate: a real address on a dead domain is dropped, lead kept.
+    _dead = {"people": [_record("dan", "dan@nowhere.invalid")],
+             "pagination": {"page": 1, "per_page": 100, "total_entries": 1}}
+    apollo.configure(post=_apollo_pages(_dead))
+    verify.configure(resolve=lambda domain, record, timeout: [])   # nothing resolves
+    try:
+        _mx = hunter.scrape_apollo(job=Job(key="a"), cfg=_apollo_cfg,
+                                   title="Video Editor", keyword="", max_results=10,
+                                   skip_known=False)
+    finally:
+        verify.configure(resolve=_offline_mx)   # restore the suite-wide fixture
+    check("an address on a dead domain is dropped by the MX gate",
+          len(_mx) == 1 and _mx[0]["email"] == "" and _mx[0]["name"] == "Dan",
+          str(_mx))
+
+    # Dedup against the vault, not just within the run.
+    vault.save_leads("apollo-seed", vault.RAW,
+                     [{"name": "Ana", "email": "ana@example.com", "source": "Apollo",
+                       "handle": "https://www.linkedin.com/in/ana"}])
+    apollo.configure(post=_apollo_pages(
+        {"people": [_record("ana", "ana@example.com"), _record("eve", "eve@example.com")],
+         "pagination": {"page": 1, "per_page": 100, "total_entries": 2}}))
+    _fresh = hunter.scrape_apollo(job=Job(key="a"), cfg=_apollo_cfg,
+                                  title="Video Editor", keyword="", max_results=40,
+                                  skip_known=True)
+    check("a contact already in the vault is skipped on re-ingest",
+          [lead["name"] for lead in _fresh] == ["Eve"], str([l["name"] for l in _fresh]))
+finally:
+    apollo.configure(post=_real_post)
 
 for suffix in ("", "-wal", "-shm"):
     Path(str(TEST_DB) + suffix).unlink(missing_ok=True)
