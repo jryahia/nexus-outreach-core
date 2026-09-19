@@ -122,7 +122,7 @@ def status_strip() -> None:
              help="Blacklisted addresses. Already-emailed leads are skipped too.")
     if not cfg.smtp.is_complete:
         st.info(
-            "Sending is locked until Zoho credentials are set. "
+            "Sending is locked until a mailbox is configured. "
             "Run the System Diagnostic tab to see exactly what is missing.",
             icon=":material/lock:",
         )
@@ -513,7 +513,7 @@ def tab_campaign() -> None:
         st.rerun()
 
     if batch is not None and not dry_run and not cfg.smtp.is_complete:
-        st.caption("Live sending needs Zoho credentials. See the Diagnostic tab.")
+        st.caption("Live sending needs a mailbox in MAILBOXES. See the Diagnostic tab.")
 
     outcome(CAMPAIGN)
     if job.snapshot()["status"] in (DONE, STOPPED, ERROR):
@@ -1176,7 +1176,7 @@ def tab_diagnostic() -> None:
     job = get_job(DIAGNOSTIC)
     st.subheader("System Diagnostic & Scan")
     st.caption(
-        "Config format, Zoho logins, the scraping engine, the vault and folder "
+        "Config format, mailbox logins, the scraping engine, the vault and folder "
         "permissions. Everything except the mailbox logins runs instantly; testing "
         "mailboxes opens a real connection per account, so it runs in the background."
     )

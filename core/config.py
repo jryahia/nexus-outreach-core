@@ -34,13 +34,48 @@ def _int(key: str, default: int) -> int:
         return default
 
 
+# Ports that mean "connect in the clear, then upgrade with STARTTLS". Anything
+# else is treated as implicit TLS, because 465 is the only port in common use
+# that expects the handshake before the greeting. Gmail rejects the wrong one
+# outright rather than negotiating, so this has to be decided per mailbox.
+STARTTLS_PORTS = frozenset({587, 25, 2525})
+
+DEFAULT_HOST = "smtp.zoho.eu"
+DEFAULT_PORT = 465
+
+# Host and port inferred from the email domain, so a mailbox can be written as
+# just "address:password" and still reach the right provider.
+KNOWN_PROVIDERS: dict[str, tuple[str, int]] = {
+    "gmail.com": ("smtp.gmail.com", 587),
+    "googlemail.com": ("smtp.gmail.com", 587),
+    "zoho.com": ("smtp.zoho.com", 465),
+    "zoho.eu": ("smtp.zoho.eu", 465),
+    "outlook.com": ("smtp-mail.outlook.com", 587),
+    "hotmail.com": ("smtp-mail.outlook.com", 587),
+    "live.com": ("smtp-mail.outlook.com", 587),
+    "yahoo.com": ("smtp.mail.yahoo.com", 465),
+    "icloud.com": ("smtp.mail.me.com", 587),
+    "me.com": ("smtp.mail.me.com", 587),
+    "fastmail.com": ("smtp.fastmail.com", 465),
+    "protonmail.com": ("smtp.protonmail.ch", 587),
+    "yandex.com": ("smtp.yandex.com", 465),
+}
+
+
 @dataclass(frozen=True)
 class SenderAccount:
-    """One Zoho mailbox in the rotation."""
+    """One mailbox in the rotation, with the transport it needs.
+
+    Host and port live on the account rather than on one global block, because
+    a pool is allowed to mix providers: a Gmail mailbox on 587 and a Zoho
+    mailbox on 465 rotate side by side, and each has to be dialled its own way.
+    """
 
     email: str
     app_password: str
     from_name: str = ""
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
 
     @property
     def label(self) -> str:
@@ -51,17 +86,86 @@ class SenderAccount:
         _, sep, domain = self.email.partition("@")
         return domain.strip() if sep and domain.strip() else "localhost"
 
+    @property
+    def use_ssl(self) -> bool:
+        """True for implicit TLS, False when the session starts in the clear."""
+        return self.port not in STARTTLS_PORTS
+
+    @property
+    def transport(self) -> str:
+        return "SSL" if self.use_ssl else "STARTTLS"
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.host}:{self.port}"
+
+
+def provider_for(email: str) -> tuple[str, int] | None:
+    """The SMTP endpoint a well-known address belongs to, or None."""
+    _, _, domain = (email or "").partition("@")
+    return KNOWN_PROVIDERS.get(domain.strip().lower())
+
 
 def mask_entry(entry: str) -> str:
-    """Show an account entry without its password. Used in diagnostics output."""
-    head, sep, _ = entry.partition(":")
-    return f"{head}:***" if sep else head
+    """Show an account entry without its password. Used in diagnostics output.
+
+    Splits from the right so the masked form works for both shapes: the long
+    "host:port:email:password" and the short "email:password".
+    """
+    body, pipe, name = entry.partition("|")
+    head, sep, _ = body.rpartition(":")
+    masked = f"{head}:***" if sep else body
+    return f"{masked}|{name}" if pipe else masked
+
+
+def _split_entry(entry: str, default_host: str = DEFAULT_HOST,
+                 default_port: int = DEFAULT_PORT
+                 ) -> tuple[str, int, str, str, str | None]:
+    """One MAILBOXES entry into (host, port, email, password, error).
+
+    Two shapes are accepted:
+
+        smtp.gmail.com:587:someone@gmail.com:app password
+        someone@gmail.com:app password
+
+    The long form is split at most three times, so the password keeps every
+    colon it contains - app passwords from several providers are generated with
+    them. The short form infers the endpoint from the address domain, falling
+    back to the configured default for a private domain.
+
+    A display name may follow a pipe on either shape.
+    """
+    body, pipe, name = entry.partition("|")
+    parts = body.split(":", 3)
+
+    if len(parts) == 4 and "@" in parts[2]:
+        host, raw_port, email, password = parts
+        try:
+            port = int(raw_port.strip())
+        except ValueError:
+            return "", 0, "", "", f"port '{raw_port.strip()}' is not a number"
+        if not 1 <= port <= 65535:
+            return "", 0, "", "", f"port {port} is out of range"
+        return host.strip(), port, email.strip().lower(), password.strip(), None
+
+    if len(parts) >= 2 and "@" in parts[0]:
+        # Short form: address first, password takes the rest of the line.
+        email = parts[0].strip().lower()
+        password = ":".join(parts[1:]).strip()
+        endpoint = provider_for(email)
+        host, port = endpoint if endpoint else (default_host, default_port)
+        return host, port, email, password, None
+
+    if len(parts) < 2:
+        return "", 0, "", "", "no colon between the address and the password"
+    return "", 0, "", "", "could not find an email address in the entry"
 
 
 def parse_accounts_report(
-    raw: str, default_from_name: str = ""
+    raw: str, default_from_name: str = "",
+    default_host: str = DEFAULT_HOST, default_port: int = DEFAULT_PORT,
 ) -> tuple[list[SenderAccount], list[dict]]:
-    """Parse ZOHO_ACCOUNTS and say what was thrown away and why.
+    """Parse MAILBOXES and say what was thrown away and why.
 
     The plain ``parse_accounts`` drops malformed entries silently, which is
     right for the send path and useless for a diagnostic: the user needs to be
@@ -76,15 +180,14 @@ def parse_accounts_report(
         if not entry or entry.startswith("#"):
             continue
 
-        email, sep, remainder = entry.partition(":")
         masked = mask_entry(entry)
-        if not sep:
-            problems.append({"entry": masked, "issue": "no colon between email and password"})
+        host, port, email, password, error = _split_entry(
+            entry, default_host, default_port)
+        if error:
+            problems.append({"entry": masked, "issue": error})
             continue
 
-        email = email.strip().lower()
-        password, pipe, name = remainder.partition("|")
-        password = password.strip()
+        _, pipe, name = entry.partition("|")
         name = name.strip() if pipe else default_from_name
 
         local, at, domain = email.partition("@")
@@ -102,39 +205,58 @@ def parse_accounts_report(
             problems.append({"entry": masked, "issue": "empty app password"})
         elif email in seen:
             problems.append({"entry": masked, "issue": "duplicate mailbox, ignored"})
+        elif not host:
+            problems.append({"entry": masked, "issue": "no SMTP host for this address"})
         else:
             seen.add(email)
             accounts.append(SenderAccount(email=email, app_password=password,
-                                          from_name=name))
+                                          from_name=name, host=host, port=port))
 
     return accounts, problems
 
 
-def parse_accounts(raw: str, default_from_name: str = "") -> list[SenderAccount]:
-    """Parse ZOHO_ACCOUNTS into a sender list.
+def parse_accounts(raw: str, default_from_name: str = "",
+                   default_host: str = DEFAULT_HOST,
+                   default_port: int = DEFAULT_PORT) -> list[SenderAccount]:
+    """Parse MAILBOXES into a sender list.
 
-        ZOHO_ACCOUNTS="a@x.com:pass1,b@y.com:pass2"
+        MAILBOXES="smtp.gmail.com:587:a@gmail.com:pass1,
+                   smtp.zoho.eu:465:b@example.com:pass2"
 
     Entries separate on comma or newline, so a multi-line .env value works too.
-    The email is split on the FIRST colon only - an app password containing a
-    colon survives intact. An optional display name goes after a pipe:
+    A short form is also accepted and infers the endpoint from the address:
 
-        a@x.com:pass1|Display Name
+        MAILBOXES="a@gmail.com:pass1"
 
-    The pipe is used rather than a third colon because a colon inside the
-    password would make a third field ambiguous.
+    In the long form the entry is split at most three times, so a password
+    containing colons survives intact. An optional display name goes after a
+    pipe on either shape:
+
+        smtp.gmail.com:587:a@gmail.com:pass1|Display Name
+
+    The pipe is used rather than another colon because a colon inside the
+    password would make the next field ambiguous.
 
     Malformed entries are dropped silently. Use ``parse_accounts_report`` when
     you need to know what was dropped.
     """
-    accounts, _ = parse_accounts_report(raw, default_from_name)
+    accounts, _ = parse_accounts_report(raw, default_from_name,
+                                        default_host, default_port)
     return accounts
 
 
 @dataclass
 class SmtpConfig:
-    host: str = "smtp.zoho.eu"
-    port: int = 465
+    """The primary mailbox, plus the fallback endpoint for short entries.
+
+    Host and port here are no longer the transport every send uses - each
+    SenderAccount carries its own. They remain as the default applied to a
+    short-form entry whose domain is not a known provider, and they describe
+    the first mailbox so the Setup and Diagnostic views have something to show.
+    """
+
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
     use_ssl: bool = True
     email: str = ""
     app_password: str = ""
@@ -147,9 +269,9 @@ class SmtpConfig:
 
     def missing_fields(self) -> list[str]:
         pairs = {
-            "ZOHO_SMTP_HOST": self.host,
-            "ZOHO_EMAIL": self.email,
-            "ZOHO_APP_PASSWORD": self.app_password,
+            "SMTP_HOST": self.host,
+            "MAILBOXES": self.email,
+            "MAILBOXES password": self.app_password,
         }
         return [k for k, v in pairs.items() if not v]
 
@@ -181,24 +303,43 @@ def load_config(refresh: bool = True) -> AppConfig:
     load_dotenv(ENV_PATH, override=refresh)
 
     from_name = os.getenv("FROM_NAME", "").strip()
-    senders = parse_accounts(os.getenv("ZOHO_ACCOUNTS", ""), from_name)
 
-    # Single-account fallback. Also keeps cfg.smtp meaningful when ZOHO_ACCOUNTS
-    # is set, because verify_smtp and the Setup tab read it.
+    # The endpoint applied to a short entry whose domain is not a known
+    # provider. ZOHO_SMTP_HOST is still read so an .env written before the
+    # rename keeps working.
+    default_host = (os.getenv("SMTP_HOST", "").strip()
+                    or os.getenv("ZOHO_SMTP_HOST", "").strip()
+                    or DEFAULT_HOST)
+    default_port = _int("SMTP_PORT", 0) or _int("ZOHO_SMTP_PORT", 0) or DEFAULT_PORT
+
+    raw_mailboxes = os.getenv("MAILBOXES", "").strip()
+    if not raw_mailboxes:
+        # Migration path: an .env from before the rename still runs untouched.
+        # Those entries are all "address:password", which the short form reads,
+        # and their endpoint comes from the old ZOHO_SMTP_* pair above.
+        raw_mailboxes = os.getenv("ZOHO_ACCOUNTS", "").strip()
+    senders = parse_accounts(raw_mailboxes, from_name, default_host, default_port)
+
+    # Single-mailbox fallback, for an .env that never used a list at all.
     if not senders:
-        single_email = os.getenv("ZOHO_EMAIL", "").strip().lower()
-        single_password = os.getenv("ZOHO_APP_PASSWORD", "").strip()
+        single_email = (os.getenv("SMTP_EMAIL", "").strip()
+                        or os.getenv("ZOHO_EMAIL", "").strip()).lower()
+        single_password = (os.getenv("SMTP_PASSWORD", "").strip()
+                           or os.getenv("ZOHO_APP_PASSWORD", "").strip())
         if single_email and single_password:
-            senders = [SenderAccount(single_email, single_password, from_name)]
+            endpoint = provider_for(single_email) or (default_host, default_port)
+            senders = [SenderAccount(single_email, single_password, from_name,
+                                     host=endpoint[0], port=endpoint[1])]
 
     primary = senders[0] if senders else None
     smtp = SmtpConfig(
-        host=os.getenv("ZOHO_SMTP_HOST", "smtp.zoho.eu").strip(),
-        port=_int("ZOHO_SMTP_PORT", 465),
-        use_ssl=_bool("ZOHO_SMTP_SSL", True),
-        email=primary.email if primary else os.getenv("ZOHO_EMAIL", "").strip(),
-        app_password=(primary.app_password if primary
-                      else os.getenv("ZOHO_APP_PASSWORD", "").strip()),
+        # Mirrors the first mailbox when there is one, so the Setup and
+        # Diagnostic views describe what will actually be dialled.
+        host=primary.host if primary else default_host,
+        port=primary.port if primary else default_port,
+        use_ssl=primary.use_ssl if primary else (default_port not in STARTTLS_PORTS),
+        email=primary.email if primary else "",
+        app_password=primary.app_password if primary else "",
         from_name=primary.from_name if primary else from_name,
         reply_to=os.getenv("REPLY_TO", "").strip(),
     )

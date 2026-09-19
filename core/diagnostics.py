@@ -135,36 +135,58 @@ def run_static_checks(cfg: AppConfig, result: ScanResult | None = None) -> ScanR
                    "Missing. Copy .env.example to .env and fill it in.", ENVIRONMENT)
 
     # -- Credentials (a) ----------------------------------------------------
-    raw_accounts = os.getenv("ZOHO_ACCOUNTS", "")
-    accounts, problems = parse_accounts_report(raw_accounts, cfg.smtp.from_name)
+    raw_mailboxes = os.getenv("MAILBOXES", "")
+    legacy = os.getenv("ZOHO_ACCOUNTS", "")
+    if not raw_mailboxes.strip() and legacy.strip():
+        result.add("MAILBOXES", WARN,
+                   "Not set - reading the older ZOHO_ACCOUNTS instead. It still "
+                   "works; rename it to MAILBOXES to use per-mailbox hosts.",
+                   CREDENTIALS)
+        raw_mailboxes = legacy
+
+    accounts, problems = parse_accounts_report(
+        raw_mailboxes, cfg.smtp.from_name, cfg.smtp.host, cfg.smtp.port)
 
     if accounts:
-        result.add("ZOHO_ACCOUNTS format", OK,
-                   f"{len(accounts)} mailbox(es) parsed for rotation", CREDENTIALS)
-    elif raw_accounts.strip():
-        result.add("ZOHO_ACCOUNTS format", FAIL,
+        providers = sorted({account.host for account in accounts})
+        result.add("MAILBOXES format", OK,
+                   f"{len(accounts)} mailbox(es) parsed for rotation across "
+                   f"{len(providers)} provider(s): {', '.join(providers)}",
+                   CREDENTIALS)
+    elif raw_mailboxes.strip():
+        result.add("MAILBOXES format", FAIL,
                    "Set, but no usable entry could be parsed.", CREDENTIALS)
     elif cfg.senders:
-        result.add("ZOHO_ACCOUNTS format", WARN,
-                   "Empty - falling back to the single ZOHO_EMAIL account. "
+        result.add("MAILBOXES format", WARN,
+                   "Empty - falling back to a single account from SMTP_EMAIL. "
                    "Add a second mailbox to enable rotation.", CREDENTIALS)
     else:
-        result.add("ZOHO_ACCOUNTS format", FAIL,
-                   "No mailbox configured. Set ZOHO_ACCOUNTS or ZOHO_EMAIL.",
-                   CREDENTIALS)
+        result.add("MAILBOXES format", FAIL,
+                   'No mailbox configured. Set MAILBOXES="host:port:address:'
+                   'password" in .env.', CREDENTIALS)
 
     for problem in problems:
         result.add(f"Entry {problem['entry']}", FAIL, problem["issue"], CREDENTIALS)
 
-    result.add("SMTP host", OK if cfg.smtp.host else FAIL,
-               cfg.smtp.host or "ZOHO_SMTP_HOST is empty", CREDENTIALS)
-    port_ok = cfg.smtp.port in (465, 587)
-    result.add("SMTP port", OK if port_ok else WARN,
-               f"{cfg.smtp.port} ({'SSL' if cfg.smtp.use_ssl else 'STARTTLS'})"
-               + ("" if port_ok else " - Zoho expects 465 for SSL or 587 for STARTTLS"),
-               CREDENTIALS)
-    result.add("App password", OK if cfg.smtp.app_password else FAIL,
-               "set" if cfg.smtp.app_password else "missing", CREDENTIALS)
+    # Every mailbox is checked on its own terms: a pool is allowed to mix
+    # providers, so one global host/port line would describe none of them.
+    for index, account in enumerate(accounts, start=1):
+        expected = account.port in (465, 587, 25, 2525)
+        detail = (f"{account.endpoint} over {account.transport}"
+                  + ("" if expected else
+                     " - unusual port; 465 expects SSL, 587 expects STARTTLS"))
+        result.add(f"Route {index}: {account.email}", OK if expected else WARN,
+                   detail, CREDENTIALS)
+        if not account.app_password:
+            result.add(f"Route {index} password", FAIL,
+                       "empty - the entry has no password after the address",
+                       CREDENTIALS)
+
+    if not accounts:
+        result.add("SMTP host", OK if cfg.smtp.host else FAIL,
+                   cfg.smtp.host or "SMTP_HOST is empty", CREDENTIALS)
+        result.add("App password", OK if cfg.smtp.app_password else FAIL,
+                   "set" if cfg.smtp.app_password else "missing", CREDENTIALS)
     result.add("From name", OK if cfg.smtp.from_name else WARN,
                cfg.smtp.from_name or "FROM_NAME is empty - emails send with a bare "
                                      "address, which reads as spam", CREDENTIALS)
@@ -318,19 +340,20 @@ def run_smtp_checks(cfg: AppConfig, result: ScanResult | None = None,
 
     senders = cfg.senders
     if not senders:
-        result.add("Zoho login", FAIL,
+        result.add("SMTP login", FAIL,
                    "No mailbox configured, so nothing to test.", MAILBOXES)
         return result
 
     for index, sender in enumerate(senders, start=1):
         if job is not None and job.cancelled:
-            result.add("Zoho login", WARN, "Scan stopped before finishing.", MAILBOXES)
+            result.add("SMTP login", WARN, "Scan stopped before finishing.", MAILBOXES)
             break
         if job is not None:
-            job.report(message=f"Testing mailbox {index}/{len(senders)}: {sender.email}")
+            job.report(message=f"Testing mailbox {index}/{len(senders)}: "
+                               f"{sender.email} at {sender.endpoint}")
         ok, detail = cannon.verify_smtp(cfg, sender)
-        result.add(f"Mailbox {index}: {sender.email}", OK if ok else FAIL,
-                   detail, MAILBOXES)
+        result.add(f"Mailbox {index}: {sender.email} ({sender.endpoint})",
+                   OK if ok else FAIL, detail, MAILBOXES)
         if job is not None:
             job.report(current=index, total=len(senders), log=detail)
     return result
@@ -345,7 +368,7 @@ def run_full_scan(*, job: Any, cfg: AppConfig, include_smtp: bool = True) -> Sca
     job.report(log=f"Static checks: {ok} passed, {warn} warnings, {fail} failed")
 
     if include_smtp and not job.cancelled:
-        job.report(message="Testing Zoho mailboxes")
+        job.report(message="Testing every mailbox in the pool")
         run_smtp_checks(cfg, result, job)
 
     ok, warn, fail = result.tally()

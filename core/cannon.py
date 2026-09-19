@@ -1,9 +1,13 @@
-"""The Cannon - multi-inbox Zoho sender with spintax, rotation and rest breaks.
+"""The Cannon - universal multi-inbox sender with spintax, rotation and breaks.
+
+Any SMTP provider works: each mailbox in the pool carries its own host, port
+and transport, so Gmail on 587 and Zoho on 465 rotate side by side. See
+core.config.parse_accounts for the MAILBOXES format.
 
 Four things make this safe to run unattended:
 
 * Sends rotate round-robin across every mailbox in ``cfg.senders``, so no single
-  Zoho account carries the whole volume. The active sender owns the From header
+  account carries the whole volume. The active sender owns the From header
   and the Message-ID domain - a rotated send that still claims to be from
   mailbox #1 is worse than not rotating at all.
 * The gap between emails is ``random.uniform(min_delay, max_delay)`` and, every
@@ -102,14 +106,29 @@ def build_message(cfg: AppConfig, sender: SenderAccount, lead: dict, subject: st
 # SMTP
 # ---------------------------------------------------------------------------
 def _connect(cfg: AppConfig, sender: SenderAccount) -> smtplib.SMTP:
+    """Open and authenticate one mailbox, on its own host and port.
+
+    The transport is decided per mailbox rather than once for the whole pool,
+    which is what lets a Gmail account on 587 and a Zoho account on 465 rotate
+    side by side. Providers do not negotiate this: Gmail answers an implicit
+    TLS handshake on 587 with a timeout, and an unencrypted EHLO on 465 with a
+    dropped connection, so guessing wrong looks like a network fault rather
+    than a misconfiguration.
+
+    ``cfg`` is still taken so the signature is stable for callers, and it
+    supplies nothing about the transport any more.
+    """
     context = ssl.create_default_context()
-    if cfg.smtp.use_ssl:
+    if sender.use_ssl:
         server: smtplib.SMTP = smtplib.SMTP_SSL(
-            cfg.smtp.host, cfg.smtp.port, timeout=30, context=context
+            sender.host, sender.port, timeout=30, context=context
         )
-    else:
-        server = smtplib.SMTP(cfg.smtp.host, cfg.smtp.port, timeout=30)
         server.ehlo()
+    else:
+        server = smtplib.SMTP(sender.host, sender.port, timeout=30)
+        server.ehlo()
+        # Gmail and Outlook both refuse AUTH on an unencrypted session, so the
+        # upgrade is mandatory rather than best-effort.
         server.starttls(context=context)
         server.ehlo()
     server.login(sender.email, sender.app_password)
@@ -119,7 +138,7 @@ def _connect(cfg: AppConfig, sender: SenderAccount) -> smtplib.SMTP:
 class SenderPool:
     """One live SMTP connection per mailbox, reconnected on demand.
 
-    Zoho closes idle sessions well inside a five-minute gap, and with rotation
+    Providers close idle sessions well inside a five-minute gap, and with rotation
     a given mailbox may sit unused for much longer than that, so every
     connection is probed with NOOP before use rather than trusted.
     """
@@ -167,25 +186,70 @@ class SenderPool:
         self._connections.clear()
 
 
+# Where each provider hides its app-password screen. A rejected login is
+# almost always an account password used where an app password is required,
+# so the error says exactly where to go rather than "check your credentials".
+APP_PASSWORD_HELP = {
+    "smtp.gmail.com": ("Gmail requires an App Password with 2-Step "
+                       "Verification on: Google Account > Security > "
+                       "2-Step Verification > App passwords."),
+    "smtp-mail.outlook.com": ("Outlook requires an app password: "
+                              "account.microsoft.com > Security > Advanced "
+                              "security options."),
+    "smtp.mail.yahoo.com": ("Yahoo requires an app password: Account Security "
+                            "> Generate app password."),
+    "smtp.mail.me.com": ("iCloud requires an app-specific password: "
+                         "appleid.apple.com > Sign-In and Security."),
+}
+ZOHO_HELP = ("Zoho requires an app-specific password: Zoho Security > "
+             "App Passwords.")
+
+
+def app_password_hint(host: str) -> str:
+    """The provider-specific instruction for a rejected login."""
+    host = (host or "").lower()
+    if host in APP_PASSWORD_HELP:
+        return APP_PASSWORD_HELP[host]
+    if "zoho" in host:
+        return ZOHO_HELP
+    return ("Most providers reject account passwords over SMTP and require an "
+            "app-specific password generated in their security settings.")
+
+
 def verify_smtp(cfg: AppConfig, sender: SenderAccount | None = None) -> tuple[bool, str]:
     """Open a connection and authenticate one mailbox. Never raises."""
     if sender is None:
         missing = cfg.smtp.missing_fields()
         if missing:
             return False, "Missing in .env: " + ", ".join(missing)
-        sender = SenderAccount(cfg.smtp.email, cfg.smtp.app_password, cfg.smtp.from_name)
+        sender = SenderAccount(cfg.smtp.email, cfg.smtp.app_password,
+                               cfg.smtp.from_name, host=cfg.smtp.host,
+                               port=cfg.smtp.port)
     try:
         server = _connect(cfg, sender)
     except smtplib.SMTPAuthenticationError as exc:
         return False, (
-            f"{sender.email}: Zoho rejected the login ({exc.smtp_code}). Use an "
-            "app-specific password from Zoho Security > App Passwords."
+            f"{sender.email}: {sender.host} rejected the login "
+            f"({exc.smtp_code}). {app_password_hint(sender.host)}"
+        )
+    except smtplib.SMTPNotSupportedError as exc:
+        return False, (
+            f"{sender.email}: {sender.endpoint} does not support the "
+            f"{sender.transport} handshake ({exc}). Port 465 expects SSL and "
+            "587 expects STARTTLS - check the port in MAILBOXES."
+        )
+    except (TimeoutError, OSError) as exc:
+        return False, (
+            f"{sender.email}: could not reach {sender.endpoint} "
+            f"({type(exc).__name__}: {exc}). A timeout here usually means the "
+            "port and the transport disagree, or a firewall is in the way."
         )
     except Exception as exc:
         return False, f"{sender.email}: {type(exc).__name__}: {exc}"
     try:
         server.noop()
-        return True, f"{sender.email} connected to {cfg.smtp.host}:{cfg.smtp.port}"
+        return True, (f"{sender.email} connected to {sender.endpoint} "
+                      f"over {sender.transport}")
     finally:
         try:
             server.quit()
@@ -250,7 +314,9 @@ def _senders_for(cfg: AppConfig) -> list[SenderAccount]:
     if cfg.senders:
         return list(cfg.senders)
     if cfg.smtp.email:
-        return [SenderAccount(cfg.smtp.email, cfg.smtp.app_password, cfg.smtp.from_name)]
+        return [SenderAccount(cfg.smtp.email, cfg.smtp.app_password,
+                              cfg.smtp.from_name, host=cfg.smtp.host,
+                              port=cfg.smtp.port)]
     # Dry runs are deliberately allowed before credentials exist. Name the gap
     # rather than writing a blank Sender column into the analytics log.
     return [SenderAccount(NO_MAILBOX, "", cfg.smtp.from_name)]
@@ -367,8 +433,8 @@ def send_campaign(
                 alive = [s for s in senders if pool.is_enabled(s)]
                 if not alive:
                     raise RuntimeError(
-                        "Every Zoho mailbox failed to authenticate. Check "
-                        "ZOHO_ACCOUNTS in .env."
+                        "Every mailbox failed to authenticate. Check "
+                        "MAILBOXES in .env."
                     )
                 sender = alive[index % len(alive)]
 
@@ -404,8 +470,8 @@ def send_campaign(
                 job.report(log=f"AUTH FAILED {sender.email} - dropped from rotation")
                 if len(pool.disabled) >= len(senders):
                     raise RuntimeError(
-                        "Every Zoho mailbox failed to authenticate. Check "
-                        "ZOHO_ACCOUNTS in .env."
+                        "Every mailbox failed to authenticate. Check "
+                        "MAILBOXES in .env."
                     ) from exc
                 continue  # retry this lead on the next mailbox
             except (smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError) as exc:

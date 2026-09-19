@@ -34,8 +34,9 @@ vault as intelligence, not as emailable contacts.
 naive scrapers keep: image filenames like `logo@2x.png`, CDN and analytics
 domains, `(at)` / `(dot)` obfuscation.
 
-**Campaign** — Sends through rotating Zoho mailboxes, round-robin, with the
-From header and Message-ID following the active sender. Randomised 2–6 minute
+**Campaign** — Sends through a rotating pool of SMTP mailboxes, round-robin,
+with the From header and Message-ID following the active sender. Gmail, Zoho,
+Outlook and custom servers can be mixed in one pool. Randomised 2–6 minute
 gaps, periodic longer breaks, a hard daily cap, and A/B template testing with
 spintax. The blacklist gate runs before a message is built, so a blocked
 address never reaches an SMTP connection.
@@ -69,7 +70,16 @@ Copy the example config and fill it in:
 cp .env.example .env
 ```
 
-At minimum set `ZOHO_ACCOUNTS` (or `ZOHO_EMAIL` + `ZOHO_APP_PASSWORD`) to send.
+At minimum set `MAILBOXES` to send. Any provider works, and they can be mixed:
+
+```
+MAILBOXES="smtp.gmail.com:587:you@gmail.com:app-password,
+           smtp.zoho.eu:465:hello@yourdomain.com:app-password"
+```
+
+The port decides the transport: 465 opens SSL directly, 587 upgrades with
+STARTTLS. A short form (`you@gmail.com:app-password`) looks the provider up
+from the address.
 Scraping works without any credentials. Use an app-specific password, never
 your account password.
 

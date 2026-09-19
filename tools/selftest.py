@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import random
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import cannon, hunter, purifier, templates, vault  # noqa: E402
+from core import config as config_module  # noqa: E402
 from core.config import (  # noqa: E402
     AppConfig, SenderAccount, SmtpConfig, parse_accounts, parse_accounts_report,
 )
@@ -263,9 +265,43 @@ check("data folders writable",
           if c.name.startswith("Write access")))
 check("missing credentials reported as failure",
       by_name["App password"].status == diagnostics.FAIL)
-check("no password ever printed",
-      not any("pass" in (c.detail or "").lower() and ":" in (c.detail or "")
-              for c in scan.checks))
+# A real leak test rather than a substring heuristic. The old form looked for
+# "pass" next to a colon, which flagged its own documentation - the message
+# telling the user the MAILBOXES format contains the word "password" - while
+# still missing any secret that happened not to contain "pass". A sentinel
+# value that could only have come from the config is the honest check.
+_SECRET = "Zx9-Sentinel:Never-Print-This"
+_leak_env = os.environ.get("MAILBOXES")
+os.environ["MAILBOXES"] = f"smtp.example.com:587:probe@example.com:{_SECRET}"
+try:
+    leaky = diagnostics.run_static_checks(
+        AppConfig(smtp=SmtpConfig(email="probe@example.com", app_password=_SECRET,
+                                  host="smtp.example.com", port=587),
+                  senders=[SenderAccount("probe@example.com", _SECRET,
+                                         host="smtp.example.com", port=587)])
+    )
+    # Malformed entries are reported back to the user, so the masking has to
+    # hold on that path too - that is where a raw secret would surface.
+    os.environ["MAILBOXES"] = f"smtp.example.com:notaport:probe@example.com:{_SECRET}"
+    broken = diagnostics.run_static_checks(
+        AppConfig(smtp=SmtpConfig(host="smtp.example.com", port=587))
+    )
+finally:
+    if _leak_env is None:
+        os.environ.pop("MAILBOXES", None)
+    else:
+        os.environ["MAILBOXES"] = _leak_env
+
+check("a configured password never reaches a check detail",
+      not any(_SECRET in (c.detail or "") for c in leaky.checks),
+      next((c.name for c in leaky.checks if _SECRET in (c.detail or "")), ""))
+check("a configured password never reaches a check name",
+      not any(_SECRET in (c.name or "") for c in leaky.checks))
+check("a rejected entry is reported with the password masked",
+      not any(_SECRET in (c.name or "") + (c.detail or "") for c in broken.checks),
+      next((c.name for c in broken.checks if _SECRET in c.name + (c.detail or "")), ""))
+check("the rejected entry is still reported",
+      any("notaport" in (c.name or "") for c in broken.checks))
 
 bad = diagnostics.run_static_checks(
     AppConfig(smtp=SmtpConfig(email="a@b.com", app_password="x"),
@@ -797,6 +833,76 @@ check("dry run logged, nothing sent",
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+print("\nuniversal mailbox pool")
+_long = parse_accounts(
+    "smtp.gmail.com:587:me@gmail.com:pw1,smtp.zoho.eu:465:hi@example.com:pw2",
+    "Fallback")
+check("a pool mixes providers", len(_long) == 2, str([a.endpoint for a in _long]))
+check("gmail keeps its own host and port",
+      _long[0].endpoint == "smtp.gmail.com:587", _long[0].endpoint)
+check("zoho keeps its own host and port",
+      _long[1].endpoint == "smtp.zoho.eu:465", _long[1].endpoint)
+
+# The port decides the handshake. Providers do not negotiate it, so getting
+# this wrong reads as a timeout rather than as a configuration error.
+check("587 means STARTTLS",
+      _long[0].use_ssl is False and _long[0].transport == "STARTTLS")
+check("465 means implicit SSL",
+      _long[1].use_ssl is True and _long[1].transport == "SSL")
+for _port in (25, 2525):
+    check(f"{_port} means STARTTLS too",
+          SenderAccount("a@b.com", "p", port=_port).use_ssl is False)
+
+# A password is allowed to contain colons; only the first three separate.
+_colons = parse_accounts("smtp.gmail.com:587:me@gmail.com:pa:ss:word")
+check("a password keeps its colons in the long form",
+      _colons[0].app_password == "pa:ss:word", _colons[0].app_password)
+
+# Short form: the provider is looked up from the address.
+_short = parse_accounts("me@gmail.com:apppass")
+check("a bare gmail address finds its server",
+      _short[0].endpoint == "smtp.gmail.com:587", _short[0].endpoint)
+check("the short form still keeps the password",
+      _short[0].app_password == "apppass")
+_custom = parse_accounts("ops@private.example:pw", "", "mail.private.example", 587)
+check("an unknown domain falls back to the configured host",
+      _custom[0].endpoint == "mail.private.example:587", _custom[0].endpoint)
+
+_named = parse_accounts("smtp.gmail.com:587:me@gmail.com:pw|Sales Team")
+check("a display name survives the long form",
+      _named[0].from_name == "Sales Team", _named[0].from_name)
+
+# Entries that cannot work are reported, not silently dropped.
+_bad, _problems = parse_accounts_report("smtp.gmail.com:abc:me@gmail.com:pw")
+check("a non-numeric port is rejected", not _bad and len(_problems) == 1,
+      str(_problems))
+check("the rejection explains itself", "not a number" in _problems[0]["issue"],
+      _problems[0]["issue"])
+_, _range = parse_accounts_report("smtp.gmail.com:99999:me@gmail.com:pw")
+check("a port outside 1-65535 is rejected",
+      bool(_range) and "out of range" in _range[0]["issue"])
+check("a masked entry never shows the password",
+      "pw" not in _problems[0]["entry"] and "***" in _problems[0]["entry"],
+      _problems[0]["entry"])
+
+# An .env written before the rename has to keep working untouched.
+_legacy = parse_accounts("old@example.com:oldpw", "", "smtp.zoho.eu", 465)
+check("a legacy two-field entry still parses",
+      len(_legacy) == 1 and _legacy[0].endpoint == "smtp.zoho.eu:465",
+      str([a.endpoint for a in _legacy]))
+
+check("a provider lookup knows gmail",
+      config_module.provider_for("x@gmail.com") == ("smtp.gmail.com", 587))
+check("a provider lookup returns nothing for an unknown domain",
+      config_module.provider_for("x@nowhere.example") is None)
+
+check("the app-password hint names the provider",
+      "Gmail" in cannon.app_password_hint("smtp.gmail.com")
+      and "Zoho" in cannon.app_password_hint("smtp.zoho.eu"))
+check("an unknown host still gets a usable hint",
+      "app-specific" in cannon.app_password_hint("mail.private.example"))
+
 print("\ngeofencing")
 _zone_pts = [
     {"city": "New York", "lat": 40.7128, "lon": -74.0060, "leads": 12,
