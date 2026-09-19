@@ -645,37 +645,32 @@ _CSS = f"""
   /* A command rail welded to the bottom edge of the viewport, full width.
      The previous version was a floating box parked over the middle of the
      page, which is exactly where the interface is. */
-  /* The terminal is appended to document.body by the runtime, so nothing in
-     Streamlit's tree can clip it - it was sizing to its own content, which is
-     why two lines looked squashed into a strip. An explicit height fixes that.
-     Every declaration is forced because this element has to win against
-     whatever Streamlit's stylesheet decides to do next to an unknown id. */
+  /* An inline console. The runtime appends it to .block-container as the last
+     element, so it sits in the document flow and pushes nothing aside - the
+     previous version was fixed to the corner and sat over the campaign
+     textareas, which made the tab unusable while a feed was running.
+     Everything is forced because this element has to hold its shape against
+     whatever Streamlit's stylesheet does to an unknown id inside its own
+     container. */
   #kill-feed {{
-      position: fixed !important;
-      bottom: 40px !important;
-      left: 40px !important;
-      width: 480px !important;
-      height: 220px !important;
-      background: rgba(0, 8, 16, 0.9) !important;
-      backdrop-filter: blur(8px) !important;
-      -webkit-backdrop-filter: blur(8px) !important;
-      border: 1px solid rgba(0, 243, 255, 0.2) !important;
-      border-left: 3px solid #00F3FF !important;
-      border-radius: 4px !important;
+      position: relative !important;
+      width: 100% !important;
+      height: 180px !important;
+      background: rgba(0, 15, 30, 0.25) !important;
+      backdrop-filter: blur(12px) !important;
+      -webkit-backdrop-filter: blur(12px) !important;
+      border: 1px solid rgba(0, 243, 255, 0.15) !important;
+      border-top: 1px solid rgba(0, 243, 255, 0.4) !important;
+      border-radius: 8px !important;
+      box-shadow: inset 0 0 20px rgba(0, 243, 255, 0.05) !important;
       padding: 15px !important;
-      z-index: 999999 !important;
+      padding-top: 30px !important;   /* clears the label strip */
+      margin-top: 30px !important;
+      margin-bottom: 30px !important;
       display: flex !important;
       flex-direction: column-reverse !important;
-      overflow: hidden !important;
-      box-shadow: 0 15px 40px rgba(0, 0, 0, 0.9) !important;
-
-      /* Not in the spec, and load-bearing. Without it this element defaults to
-         pointer-events:auto, and at z-index 999999 a 480x220 rectangle over
-         the bottom-left corner would swallow every click meant for the app
-         underneath it. An overlay that eats input is a bug no matter how good
-         it looks. This also costs the hover-to-reveal on the idle state, which
-         is the right trade. */
-      pointer-events: none !important;
+      overflow-y: hidden !important;
+      z-index: 10 !important;
 
       font-family: {MONO_FONT};
       font-size: 11px;
@@ -685,28 +680,27 @@ _CSS = f"""
       transition: opacity 0.35s {EASE};
       opacity: 0;
   }}
+  /* Until the first line lands there is nothing to show, and an empty console
+     holding 240px of vertical space at the bottom of every tab is worse than
+     no console. It takes no room until it has something to say. */
+  #kill-feed:not(.live) {{ display: none !important; }}
   #kill-feed.live {{ opacity: 1; }}
-  /* Idle. The panel steps back when it has nothing to report rather than
-     holding the corner at full strength, and any new line brings it straight
-     back. It stays legible at this level: with pointer-events off there is no
-     hover to recall it, so it can never fade to something that reads as
-     broken. */
-  #kill-feed.idle {{ opacity: 0.45; }}
 
   #kill-feed .hd {{
       position: absolute;
       top: 0; left: 0; right: 0;
-      padding: 6px 12px 8px 12px;
+      padding: 9px 15px 7px 15px;
       color: {MUTED};
       font-size: 8.5px;
       letter-spacing: 0.24em;
       display: flex;
       justify-content: space-between;
       pointer-events: none;
-      /* A fade rather than a solid bar, so a line scrolling up dissolves
-         under the label instead of being cut in half by it. */
-      background: linear-gradient(180deg, rgba(0, 8, 16, 0.96) 55%,
-                                          rgba(0, 8, 16, 0));
+      border-radius: 8px 8px 0 0;
+      /* A fade, so a line scrolling up dissolves under the label rather than
+         being cut in half by it. */
+      background: linear-gradient(180deg, rgba(0, 15, 30, 0.85) 60%,
+                                          rgba(0, 15, 30, 0));
       z-index: 1;
   }}
   #kill-feed .ln {{
@@ -1927,20 +1921,34 @@ _HUD_JS = r"""
   // path at all: a line pushed from a campaign worker reaches this terminal in
   // the time it takes a loopback socket to deliver a frame.
   var feedEl = null, feedSock = null, feedRetry = 0, feedTimer = null;
-  var feedIdle = null;
   var FEED_MAX_LINES = 60;
-  var FEED_IDLE_MS = 20000;
+
+  // The console lives at the end of the Streamlit column rather than on top
+  // of it. That means Streamlit owns its parent, and a rerun that rebuilds the
+  // column will carry the console out with it - so the node is kept and put
+  // back rather than recreated, which is what preserves the scrollback.
+  function feedHost() {
+    return D.querySelector('.block-container') || D.body;
+  }
 
   function buildFeed() {
-    if (D.getElementById('kill-feed')) { return; }
-    feedEl = D.createElement('div');
-    feedEl.id = 'kill-feed';
-    feedEl.setAttribute('aria-hidden', 'true');
-    var head = D.createElement('div');
-    head.className = 'hd';
-    head.innerHTML = '<span>NEXUS KILL-FEED</span><span class="st">LINK DOWN</span>';
-    feedEl.appendChild(head);
-    D.body.appendChild(feedEl);
+    if (!feedEl) {
+      feedEl = D.createElement('div');
+      feedEl.id = 'kill-feed';
+      feedEl.setAttribute('aria-hidden', 'true');
+      var head = D.createElement('div');
+      head.className = 'hd';
+      head.innerHTML = '<span>NEXUS KILL-FEED</span>' +
+                       '<span class="st">LINK DOWN</span>';
+      feedEl.appendChild(head);
+    }
+    var host = feedHost();
+    // Re-append only when it is genuinely detached or no longer last. Doing it
+    // unconditionally would move the node on every observer pass, and moving a
+    // node is a mutation, which would call the observer again.
+    if (feedEl.parentNode !== host || host.lastElementChild !== feedEl) {
+      host.appendChild(feedEl);
+    }
   }
 
   function feedStatus(text) {
@@ -1967,13 +1975,6 @@ _HUD_JS = r"""
       lines = feedEl.querySelectorAll('.ln');
     }
     feedEl.classList.add('live');
-    feedEl.classList.remove('idle');
-    // A quiet spell means the campaign is between sends, so the terminal
-    // stands down until it has something to say again.
-    if (feedIdle) { P.clearTimeout(feedIdle); }
-    feedIdle = P.setTimeout(function () {
-      if (feedEl) { feedEl.classList.add('idle'); }
-    }, FEED_IDLE_MS);
   }
 
   function connectFeed() {
@@ -2350,6 +2351,7 @@ _HUD_JS = r"""
       readState();
       readGhost();
       connectFeed();
+      if (feedEl) { buildFeed(); }   // Streamlit rebuilt the column; re-seat it
     });
   }
 
@@ -2406,7 +2408,6 @@ _HUD_JS = r"""
     if (P.speechSynthesis) { try { P.speechSynthesis.cancel(); } catch (e) {} }
     speech.queue = [];
     if (feedTimer) { P.clearTimeout(feedTimer); feedTimer = null; }
-    if (feedIdle) { P.clearTimeout(feedIdle); feedIdle = null; }
     if (feedSock) {
       // Drop the handler first: onclose would otherwise schedule a reconnect
       // for a HUD that is being torn down.
