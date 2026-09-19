@@ -12,6 +12,7 @@ which is raised deliberately because it needs a decision from the user.
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import threading
 from typing import Any, Callable
@@ -144,6 +145,137 @@ def scroll_until_stale(job: Any, rounds: int = 5,
 
     action.rounds_used = 0
     return action
+
+
+# Caption text as each platform stores it, and the hashtags inside it. Mining
+# the whole document instead would harvest the CSS palette: "#ffffff" is the
+# most common "hashtag" on an Instagram page by a factor of three.
+_IG_CAPTION_RE = re.compile(r'"caption"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_TT_CAPTION_RE = re.compile(r'"desc"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_HASHTAG_RE = re.compile(r"#([A-Za-z][A-Za-z0-9_]{3,29})")
+
+# How many tags one page contributes, and how many pages a whole sweep will
+# spend. Each is a page load, and a gated one buys nothing.
+MAX_MINED_TAGS = 4
+MAX_SWEEP_TAGS = 14
+
+# Seconds to wait between tag pages. Six back-to-back loads from one
+# address is what the per-IP rate limit is watching for, and a gated tag
+# returns nothing at all, so the pause buys more than it costs.
+SWEEP_PACE = (1.5, 4.0)
+
+
+def mine_tags(html: str, seed: str, caption_re: re.Pattern,
+              limit: int = MAX_MINED_TAGS) -> list[str]:
+    """The hashtags real posts on this page carry.
+
+    Worth more than the invented variants, and measurably so. For "video
+    editor" the invented tags (#videoeditoragency, #videoeditorstudio, ...)
+    were all gated for low volume and returned nothing, leaving the union at
+    the 10 accounts the seed tag already had. The tags the captions actually
+    used - #videoediting, #soundeffects, #tutorials - returned 43.
+
+    Tags that share ground with the niche are chased first, so a thin budget
+    is spent on neighbours rather than on whatever went viral that week.
+    """
+    counts: dict[str, int] = {}
+    for caption in caption_re.findall(html):
+        for tag in _HASHTAG_RE.findall(caption):
+            tag = tag.lower()
+            counts[tag] = counts.get(tag, 0) + 1
+    counts.pop(seed.lower(), None)
+
+    words = [w for w in re.split(r"[^a-z0-9]+", seed.lower()) if len(w) > 3]
+
+    def rank(tag: str) -> tuple[int, int]:
+        related = (any(word in tag for word in words)
+                   or any(term in tag for term in INTENT_TERMS))
+        return (0 if related else 1, -counts[tag])
+
+    return sorted(counts, key=rank)[:limit]
+
+
+def _sweep_tags(*, job: Any, seed: str, queries: list[str], max_results: int,
+                platform: str, url_for: Callable, fetch: Callable,
+                walled: Callable, handle_re: re.Pattern,
+                caption_re: re.Pattern) -> tuple[list[str], int, int]:
+    """Walk a queue of tags, harvesting handles and new tags as it goes.
+
+    Returns the handles, how many tags were gated, and how many were tried.
+    The queue grows: every page that loads contributes the tags its captions
+    used, which is where most of the volume comes from.
+    """
+    announce(f"SWEEP    {platform}, {len(queries)} tags: "
+             f"{', '.join('#' + q for q in queries[:4])}"
+             + (" ..." if len(queries) > 4 else ""), killfeed.INFO)
+
+    pending = list(queries)
+    # Only the niche's own tags are mined. Chaining one mined tag into the next
+    # drifts: "video editor" reached #editor, then #editorial, then #makeup,
+    # and started harvesting makeup artists. Volume the operator cannot sell is
+    # not volume.
+    rooted = set(queries)
+    seen_tags: set[str] = set()
+    handles: list[str] = []
+    walls = tried = 0
+
+    while (pending and len(handles) < max_results and tried < MAX_SWEEP_TAGS
+           and not job.cancelled):
+        query = pending.pop(0)
+        if query in seen_tags:
+            continue
+        seen_tags.add(query)
+        if tried and SWEEP_PACE[1]:
+            if job.wait(random.uniform(*SWEEP_PACE)):
+                break
+        tried += 1
+
+        try:
+            page = fetch(url_for(query))
+        except LoginRequired:
+            raise
+        except Exception as exc:
+            job.report(current=tried,
+                       log=f"#{query} failed ({type(exc).__name__}: {exc})")
+            continue
+
+        if walled(page):
+            walls += 1
+            job.report(current=tried, log=f"#{query} is gated for logged-out visitors")
+            announce(f"GATED     #{query} on {platform}", killfeed.WARN)
+            continue
+
+        html = page.html_content
+        fresh = [h for h in dict.fromkeys(handle_re.findall(html)) if h not in handles]
+        handles.extend(fresh)
+
+        mined = ([t for t in mine_tags(html, seed, caption_re)
+                  if t not in seen_tags and t not in pending]
+                 if query in rooted else [])
+        if mined:
+            # To the front of the queue. A tag the captions actually use beats
+            # one built by gluing words together: for "video editor" every
+            # invented variant was gated and returned nothing, while the mined
+            # ones carried the harvest from 10 accounts to 33.
+            pending[:0] = mined
+            job.report(log="Picked up from live captions: "
+                           + ", ".join("#" + t for t in mined))
+
+        job.report(total=tried + len(pending), current=tried,
+                   message=f"{len(handles)} profiles from {tried} tags")
+        announce(f"HARVESTED {len(fresh):>3} profiles from {platform} #{query} "
+                 f"({len(handles)} total)", killfeed.OK if fresh else killfeed.WARN)
+
+    return handles[:max_results], walls, tried
+
+
+def _seed_from(target: str) -> str:
+    """The niche inside whatever was typed, including a pasted tag url."""
+    cleaned = (target or "").strip().lstrip("#")
+    # ".../explore/tags/realestate/" ends in an empty segment; the niche is the
+    # one before it.
+    parts = [part for part in cleaned.split("/") if part.strip()]
+    return parts[-1].strip() if parts else ""
 
 
 class ProxyPool:
@@ -916,40 +1048,24 @@ def scrape_instagram(
         handles = [target.lstrip("@").strip("/")]
         job.report(message=f"Instagram profile {target}")
     else:
-        seed = target.lstrip("#").split("/")[-1].strip()
+        seed = _seed_from(target)
         queries = expand_queries(seed)
+        if not queries:
+            job.report(message="Nothing to hunt for in that target")
+            return []
         job.report(total=len(queries), current=0,
                    message=f"Instagram: sweeping {len(queries)} tags for '{seed}'")
-        announce(f"SWEEP    Instagram, {len(queries)} tags: "
-                 f"{', '.join('#' + q for q in queries[:4])}"
-                 + (" ..." if len(queries) > 4 else ""), killfeed.INFO)
-
-        handles, walls = [], 0
-        for index, query in enumerate(queries, start=1):
-            if job.cancelled or len(handles) >= max_results:
-                break
-            page = _ig_fetch(
-                f"https://www.instagram.com/explore/tags/{quote_plus(query)}/",
-                cfg, ghost, job=job)
-            if _ig_walled(page):
-                walls += 1
-                job.report(current=index, log=f"#{query} is gated for logged-out "
-                                              "visitors")
-                continue
-            fresh = [h for h in dict.fromkeys(_IG_USER_RE.findall(page.html_content))
-                     if h not in handles]
-            handles.extend(fresh)
-            job.report(current=index,
-                       message=f"{len(handles)} profiles from {index}/{len(queries)} tags")
-            announce(f"HARVESTED {len(fresh):>3} profiles from Instagram #{query} "
-                     f"({len(handles)} total)",
-                     killfeed.OK if fresh else killfeed.WARN)
-
-        handles = handles[:max_results]
+        handles, walls, tried = _sweep_tags(
+            job=job, seed=seed, queries=queries, max_results=max_results,
+            platform="Instagram",
+            url_for=lambda q: f"https://www.instagram.com/explore/tags/{quote_plus(q)}/",
+            fetch=lambda url: _ig_fetch(url, cfg, ghost, job=job),
+            walled=_ig_walled, handle_re=_IG_USER_RE, caption_re=_IG_CAPTION_RE,
+        )
         if not handles:
             # Every tag gated is a different problem from a tag with no posts,
             # and the operator can only act on the first one.
-            if walls == len(queries) and queries:
+            if tried and walls == tried:
                 raise LoginRequired(
                     "Instagram gated every tag tried. Anonymous tag pages are "
                     "rate limited per IP - wait a few minutes, set NEXUS_PROXY, "
@@ -1085,34 +1201,20 @@ def scrape_tiktok(
         handles = [target.lstrip("@").strip("/")]
         job.report(message=f"TikTok profile {target}")
     else:
-        seed = target.lstrip("#").split("/")[-1].strip()
+        seed = _seed_from(target)
         queries = expand_queries(seed)
+        if not queries:
+            job.report(message="Nothing to hunt for in that target")
+            return []
         job.report(total=len(queries), current=0,
                    message=f"TikTok: sweeping {len(queries)} tags for '{seed}'")
-        announce(f"SWEEP    TikTok, {len(queries)} tags: "
-                 f"{', '.join('#' + q for q in queries[:4])}"
-                 + (" ..." if len(queries) > 4 else ""), killfeed.INFO)
-
-        handles, walls = [], 0
-        for index, query in enumerate(queries, start=1):
-            if job.cancelled or len(handles) >= max_results:
-                break
-            page = _tt_fetch(f"https://www.tiktok.com/tag/{quote_plus(query)}",
-                             cfg, ghost, job=job)
-            if _tt_walled(page):
-                walls += 1
-                job.report(current=index, log=f"#{query} hit the TikTok login wall")
-                continue
-            fresh = [h for h in dict.fromkeys(_TT_ID_RE.findall(page.html_content))
-                     if h not in handles]
-            handles.extend(fresh)
-            job.report(current=index,
-                       message=f"{len(handles)} profiles from {index}/{len(queries)} tags")
-            announce(f"HARVESTED {len(fresh):>3} profiles from TikTok #{query} "
-                     f"({len(handles)} total)",
-                     killfeed.OK if fresh else killfeed.WARN)
-
-        handles = handles[:max_results]
+        handles, walls, _tried = _sweep_tags(
+            job=job, seed=seed, queries=queries, max_results=max_results,
+            platform="TikTok",
+            url_for=lambda q: f"https://www.tiktok.com/tag/{quote_plus(q)}",
+            fetch=lambda url: _tt_fetch(url, cfg, ghost, job=job),
+            walled=_tt_walled, handle_re=_TT_ID_RE, caption_re=_TT_CAPTION_RE,
+        )
         if not handles:
             # TikTok gates every anonymous visitor, so this is the expected
             # path rather than an edge case, and the fix is a stored session.

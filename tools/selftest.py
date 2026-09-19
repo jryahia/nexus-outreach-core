@@ -1620,7 +1620,9 @@ def _stub_profile(handle, cfg, job, ghost=False):
 _real_fetch = hunter.StealthyFetcher.fetch
 _real_tt_profile = hunter._tt_profile
 _real_ig_profile = hunter._ig_profile
+_real_pace = hunter.SWEEP_PACE
 try:
+    hunter.SWEEP_PACE = (0.0, 0.0)   # the live pause is checked separately
     hunter._tt_profile = _stub_profile
     hunter._ig_profile = _stub_profile
 
@@ -1707,6 +1709,140 @@ finally:
     hunter.StealthyFetcher.fetch = _real_fetch
     hunter._tt_profile = _real_tt_profile
     hunter._ig_profile = _real_ig_profile
+    hunter.SWEEP_PACE = _real_pace
+
+# ---------------------------------------------------------------------------
+print("\ntag mining")
+# Measured: the invented variants for "video editor" were all gated and the
+# union stayed at 10. The tags the captions actually used returned 43.
+_IG_HTML = (
+    '{"caption":{"text":"cut this in 20 minutes #videoediting #soundeffects"},'
+    '"caption":{"text":"my rig #videoediting #tutorials #viral"},'
+    '"caption":{"text":"colour pass #videoeditor #videoediting"}}'
+)
+_mined = hunter.mine_tags(_IG_HTML, "videoeditor", hunter._IG_CAPTION_RE)
+check("captions give up their hashtags", "videoediting" in _mined, str(_mined))
+check("the seed tag is not chased twice", "videoeditor" not in _mined)
+check("a tag sharing ground with the niche outranks a viral one",
+      _mined.index("videoediting") < _mined.index("viral"), str(_mined))
+check("the mining budget is respected",
+      len(hunter.mine_tags(_IG_HTML, "videoeditor", hunter._IG_CAPTION_RE, 2)) == 2)
+# The page's CSS palette is full of "#ffffff"; mining the whole document
+# instead of the captions harvests colours and spends the budget on nothing.
+check("the CSS palette is not mistaken for hashtags",
+      not hunter.mine_tags('<style>a{color:#ffffff;background:#f2f4f6}</style>',
+                           "videoeditor", hunter._IG_CAPTION_RE))
+check("TikTok descriptions are mined too",
+      "dronefpv" in hunter.mine_tags('{"desc":"sunset run #dronefpv #drone"}',
+                                     "drone", hunter._TT_CAPTION_RE))
+check("no captions is not an error",
+      hunter.mine_tags("", "drone", hunter._IG_CAPTION_RE) == [])
+
+print("\nsweep pacing and targets")
+check("tag pages are paced apart by default",
+      hunter.SWEEP_PACE[0] >= 1 and hunter.SWEEP_PACE[1] > hunter.SWEEP_PACE[0],
+      str(hunter.SWEEP_PACE))
+# A pasted tag url ends in an empty segment; taking the last one hunts nothing.
+check("a pasted tag url still finds the niche",
+      hunter._seed_from("https://www.instagram.com/explore/tags/realestate/")
+      == "realestate")
+check("a pasted url without the trailing slash works too",
+      hunter._seed_from("https://www.tiktok.com/tag/drone") == "drone")
+check("a bare hashtag survives", hunter._seed_from("#realestate") == "realestate")
+check("a plain niche survives", hunter._seed_from("real estate") == "real estate")
+check("an empty target yields an empty seed", hunter._seed_from("   /  ") == "")
+
+
+class _PacedJob(Job):
+    """Records every pause the sweep asks for."""
+
+    def __init__(self):
+        super().__init__(key="paced")
+        self.waits = []
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        return False
+
+
+_paced = _PacedJob()
+_seen = []
+
+
+def _one_page(url):
+    _seen.append(url)
+    return type("P", (), {"status": 200, "url": url,
+                          "html_content": '{"username":"solo"}',
+                          "css": lambda self, sel: ["Tag"]})()
+
+
+_handles, _walls, _tried = hunter._sweep_tags(
+    job=_paced, seed="drone", queries=["drone", "droneeditor", "droneagency"],
+    max_results=40, platform="Instagram",
+    url_for=lambda q: f"https://x/{q}/", fetch=_one_page,
+    walled=lambda page: False, handle_re=hunter._IG_USER_RE,
+    caption_re=hunter._IG_CAPTION_RE,
+)
+check("the sweep pauses between tags, not before the first",
+      len(_paced.waits) == _tried - 1, f"{len(_paced.waits)} waits, {_tried} tags")
+check("every pause falls inside the configured window",
+      all(hunter.SWEEP_PACE[0] <= w <= hunter.SWEEP_PACE[1] for w in _paced.waits),
+      str([round(w, 2) for w in _paced.waits]))
+
+
+class _StoppingJob(_PacedJob):
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        return True          # STOP was pressed during the pause
+
+
+_stopper = _StoppingJob()
+_, _, _tried_stop = hunter._sweep_tags(
+    job=_stopper, seed="drone", queries=["a", "b", "c", "d"], max_results=40,
+    platform="Instagram", url_for=lambda q: f"https://x/{q}/", fetch=_one_page,
+    walled=lambda page: False, handle_re=hunter._IG_USER_RE,
+    caption_re=hunter._IG_CAPTION_RE,
+)
+check("STOP pressed mid-pause ends the sweep there", _tried_stop == 1, _tried_stop)
+
+
+def _dying_page(url):
+    raise RuntimeError("connection reset")
+
+
+_survivor = _PacedJob()
+_h, _w, _t = hunter._sweep_tags(
+    job=_survivor, seed="drone", queries=["a", "b"], max_results=40,
+    platform="Instagram", url_for=lambda q: f"https://x/{q}/", fetch=_dying_page,
+    walled=lambda page: False, handle_re=hunter._IG_USER_RE,
+    caption_re=hunter._IG_CAPTION_RE,
+)
+# A dead socket is not a login wall, and must not be reported as one.
+check("a tag that fails to load is not counted as gated",
+      _t == 2 and _w == 0 and _h == [], f"tried {_t}, walls {_w}")
+
+
+def _mining_page(url):
+    # The first tag's captions name a tag the sweep never would have guessed.
+    body = ('{"caption":{"text":"#dronefilming"},"username":"first"}'
+            if "/drone/" in url else '{"username":"second"}')
+    return type("P", (), {"status": 200, "url": url, "html_content": body,
+                          "css": lambda self, sel: ["Tag"]})()
+
+
+_miner = _PacedJob()
+_seen_urls = []
+_h, _, _ = hunter._sweep_tags(
+    job=_miner, seed="drone", queries=["drone"], max_results=40,
+    platform="Instagram",
+    url_for=lambda q: _seen_urls.append(q) or f"https://x/{q}/",
+    fetch=_mining_page, walled=lambda page: False, handle_re=hunter._IG_USER_RE,
+    caption_re=hunter._IG_CAPTION_RE,
+)
+check("a tag found in live captions is queued and hunted",
+      "dronefilming" in _seen_urls, str(_seen_urls))
+check("and its accounts reach the harvest", "second" in _h, str(_h))
+
 
 for suffix in ("", "-wal", "-shm"):
     Path(str(TEST_DB) + suffix).unlink(missing_ok=True)
