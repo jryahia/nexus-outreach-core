@@ -71,6 +71,80 @@ _TT_LINK_RE = re.compile(r'"bioLink"\s*:\s*\{\s*"link"\s*:\s*"((?:[^"\\]|\\.)*)"
 
 SKIPPED_NOTE = "Skipped (Already in Vault)"
 
+# High-intent terms appended to a bare niche. A creator who tags a clip
+# "#realestate" is usually the subject; one who tags it "#realestateeditor" is
+# usually for hire, and only the second is a lead.
+INTENT_TERMS = ("editor", "agency", "creator", "studio", "production",
+                "freelance", "media")
+
+# How many query variants one hunt will spend. Each is a page load, and the
+# platforms rate-limit an anonymous visitor hard, so this is deliberately not
+# "try everything".
+MAX_QUERY_VARIANTS = 6
+
+
+def expand_queries(niche: str, extra_terms: tuple[str, ...] = INTENT_TERMS,
+                   limit: int = MAX_QUERY_VARIANTS) -> list[str]:
+    """A niche turned into several tags worth trying.
+
+    Measured on Instagram: one tag returns about ten public accounts and no
+    more, however far the page is scrolled. Volume therefore comes from asking
+    several related questions rather than from asking one question harder.
+
+    The bare niche is kept first - it is what the operator actually typed, and
+    it is the one query guaranteed to be on-topic.
+    """
+    base = re.sub(r"[^a-z0-9 ]+", "", (niche or "").lower()).strip()
+    if not base:
+        return []
+    compact = base.replace(" ", "")
+    queries = [compact]
+    for term in extra_terms:
+        if term in compact:
+            continue                      # "video editor" + "editor" is noise
+        queries.append(f"{compact}{term}")
+    # Word order matters to the platforms: "editorvideo" is not a tag anyone
+    # uses, so the niche always leads.
+    out: list[str] = []
+    for query in queries:
+        if query and query not in out:
+            out.append(query)
+    return out[:limit]
+
+
+def scroll_until_stale(job: Any, rounds: int = 5,
+                       pause: int = 1000) -> Callable:
+    """A page_action that scrolls, and stops as soon as scrolling stops paying.
+
+    Written to be cheap when it is useless. Instagram and TikTok serve an
+    anonymous visitor a fixed slab of markup: measured across four scrolls on a
+    hashtag page, the document stayed at 989,905 bytes and not one extra
+    profile appeared. So each round is compared against the last and the loop
+    breaks on the first that adds nothing, which costs one second rather than
+    five on every walled page - while still unrolling a feed that does grow,
+    such as a logged-in session or a Maps result list.
+    """
+    def action(page):
+        previous = 0
+        for index in range(rounds):
+            if job is not None and job.cancelled:
+                break
+            try:
+                size = page.evaluate("() => document.documentElement.innerHTML.length")
+                if index and size <= previous:
+                    break                 # the page is done growing
+                previous = size
+                page.evaluate(
+                    "() => window.scrollBy(0, document.body.scrollHeight)")
+                page.wait_for_timeout(pause)
+            except Exception:
+                break
+        action.rounds_used = index + 1 if rounds else 0
+        return page
+
+    action.rounds_used = 0
+    return action
+
 
 class ProxyPool:
     """Round-robin over the configured proxies.
@@ -763,15 +837,21 @@ def _ig_walled(page) -> bool:
     return "/accounts/login" in str(page.url) or "loginForm" in page.html_content[:20000]
 
 
-def _ig_fetch(url: str, cfg: AppConfig, ghost: bool = False):
-    return StealthyFetcher.fetch(
-        url,
-        headless=cfg.headless,
-        timeout=max(cfg.request_timeout, 60000),
-        network_idle=False,
-        google_search=True,
-        **stealth_kwargs(cfg, ghost),
-    )
+def _ig_fetch(url: str, cfg: AppConfig, ghost: bool = False, job: Any = None):
+    kwargs: dict[str, Any] = {
+        "headless": cfg.headless,
+        "timeout": max(cfg.request_timeout, 60000),
+        "network_idle": False,
+        "google_search": True,
+    }
+    if cfg.ig_profile_dir:
+        # With a stored session the feed actually extends, so the scroller has
+        # something to unroll. Without one it exits on the first round.
+        kwargs["user_data_dir"] = cfg.ig_profile_dir
+    if job is not None:
+        kwargs["page_action"] = scroll_until_stale(job)
+    kwargs.update(stealth_kwargs(cfg, ghost))
+    return StealthyFetcher.fetch(url, **kwargs)
 
 
 def _ig_profile(handle: str, cfg: AppConfig, job: Any,
@@ -829,24 +909,54 @@ def scrape_instagram(
     if not target:
         return []
 
-    if target.startswith("#") or "explore/tags" in target:
-        tag = target.lstrip("#").split("/")[-1].strip()
-        job.report(message=f"Instagram hashtag #{tag}")
-        page = _ig_fetch(
-            f"https://www.instagram.com/explore/tags/{quote_plus(tag)}/", cfg, ghost)
-        html = page.html_content
-        if _ig_walled(page):
-            raise LoginRequired(
-                f"Instagram sent #{tag} to the login page. Low-volume tags are gated "
-                "for logged-out visitors - use a broader tag, or a single @account."
-            )
-        handles = list(dict.fromkeys(_IG_USER_RE.findall(html)))[:max_results]
-        if not handles:
-            job.report(message=f"No public accounts surfaced for #{tag}")
-            return []
-        job.report(log=f"{len(handles)} accounts from #{tag}")
-    else:
+    # A single @account is a lookup. Anything else is a search, and a search
+    # sweeps several tags: one tag returns about ten public accounts and stops,
+    # so the only way to a useful list is to ask more than once.
+    if target.startswith("@") and " " not in target:
         handles = [target.lstrip("@").strip("/")]
+        job.report(message=f"Instagram profile {target}")
+    else:
+        seed = target.lstrip("#").split("/")[-1].strip()
+        queries = expand_queries(seed)
+        job.report(total=len(queries), current=0,
+                   message=f"Instagram: sweeping {len(queries)} tags for '{seed}'")
+        announce(f"SWEEP    Instagram, {len(queries)} tags: "
+                 f"{', '.join('#' + q for q in queries[:4])}"
+                 + (" ..." if len(queries) > 4 else ""), killfeed.INFO)
+
+        handles, walls = [], 0
+        for index, query in enumerate(queries, start=1):
+            if job.cancelled or len(handles) >= max_results:
+                break
+            page = _ig_fetch(
+                f"https://www.instagram.com/explore/tags/{quote_plus(query)}/",
+                cfg, ghost, job=job)
+            if _ig_walled(page):
+                walls += 1
+                job.report(current=index, log=f"#{query} is gated for logged-out "
+                                              "visitors")
+                continue
+            fresh = [h for h in dict.fromkeys(_IG_USER_RE.findall(page.html_content))
+                     if h not in handles]
+            handles.extend(fresh)
+            job.report(current=index,
+                       message=f"{len(handles)} profiles from {index}/{len(queries)} tags")
+            announce(f"HARVESTED {len(fresh):>3} profiles from Instagram #{query} "
+                     f"({len(handles)} total)",
+                     killfeed.OK if fresh else killfeed.WARN)
+
+        handles = handles[:max_results]
+        if not handles:
+            # Every tag gated is a different problem from a tag with no posts,
+            # and the operator can only act on the first one.
+            if walls == len(queries) and queries:
+                raise LoginRequired(
+                    "Instagram gated every tag tried. Anonymous tag pages are "
+                    "rate limited per IP - wait a few minutes, set NEXUS_PROXY, "
+                    "or hunt a single @account instead."
+                )
+            job.report(message=f"No public accounts surfaced for '{seed}'")
+            return []
 
     known = load_known(skip_known, job)
     job.report(total=len(handles), current=0, message=f"Reading {len(handles)} bios")
@@ -904,9 +1014,17 @@ def _tt_walled(page) -> bool:
             or "/login?redirect_url" in html[:4000])
 
 
-def _tt_profile(handle: str, cfg: AppConfig, job: Any,
-                ghost: bool = False) -> dict | None:
-    handle = handle.lstrip("@").strip("/")
+_TT_ID_RE = re.compile(r'"uniqueId"\s*:\s*"([A-Za-z0-9._]{2,30})"')
+
+
+def _tt_fetch(url: str, cfg: AppConfig, ghost: bool = False, job: Any = None):
+    """One place that knows how to open TikTok.
+
+    TikTok serves an anonymous visitor a login wall on every tag and search
+    page - measured, not assumed - so the stored session in TIKTOK_PROFILE_DIR
+    is the difference between a hunt and a wall. With it the feed extends, and
+    the scroller has something to unroll.
+    """
     kwargs: dict[str, Any] = {
         "headless": cfg.headless,
         "timeout": max(cfg.request_timeout, 60000),
@@ -915,9 +1033,18 @@ def _tt_profile(handle: str, cfg: AppConfig, job: Any,
     }
     if cfg.tiktok_profile_dir:
         kwargs["user_data_dir"] = cfg.tiktok_profile_dir
+    if job is not None:
+        kwargs["page_action"] = scroll_until_stale(job)
     kwargs.update(stealth_kwargs(cfg, ghost))
+    return StealthyFetcher.fetch(url, **kwargs)
 
-    page = StealthyFetcher.fetch(f"https://www.tiktok.com/@{quote_plus(handle)}", **kwargs)
+
+def _tt_profile(handle: str, cfg: AppConfig, job: Any,
+                ghost: bool = False) -> dict | None:
+    handle = handle.lstrip("@").strip("/")
+    # No scroller here: a profile page is one slab of markup, and scrolling it
+    # costs a second per handle for nothing.
+    page = _tt_fetch(f"https://www.tiktok.com/@{quote_plus(handle)}", cfg, ghost)
     if _tt_walled(page):
         raise LoginRequired(TIKTOK_WALL_HINT)
 
@@ -953,30 +1080,46 @@ def scrape_tiktok(
     if not target:
         return []
 
-    if target.startswith("#") or "/tag/" in target:
-        tag = target.lstrip("#").split("/")[-1].strip()
-        job.report(message=f"TikTok hashtag #{tag}")
-        kwargs: dict[str, Any] = {
-            "headless": cfg.headless,
-            "timeout": max(cfg.request_timeout, 60000),
-            "network_idle": False,
-            "google_search": True,
-        }
-        if cfg.tiktok_profile_dir:
-            kwargs["user_data_dir"] = cfg.tiktok_profile_dir
-        kwargs.update(stealth_kwargs(cfg, ghost))
-        page = StealthyFetcher.fetch(f"https://www.tiktok.com/tag/{quote_plus(tag)}", **kwargs)
-        if _tt_walled(page):
-            raise LoginRequired(TIKTOK_WALL_HINT)
-        handles = list(dict.fromkeys(
-            re.findall(r'"uniqueId"\s*:\s*"([A-Za-z0-9._]{2,30})"', page.html_content)
-        ))[:max_results]
-        if not handles:
-            job.report(message=f"No accounts surfaced for #{tag}")
-            return []
-        job.report(log=f"{len(handles)} accounts from #{tag}")
-    else:
+    # As with Instagram: one @account is a lookup, anything else is a sweep.
+    if target.startswith("@") and " " not in target:
         handles = [target.lstrip("@").strip("/")]
+        job.report(message=f"TikTok profile {target}")
+    else:
+        seed = target.lstrip("#").split("/")[-1].strip()
+        queries = expand_queries(seed)
+        job.report(total=len(queries), current=0,
+                   message=f"TikTok: sweeping {len(queries)} tags for '{seed}'")
+        announce(f"SWEEP    TikTok, {len(queries)} tags: "
+                 f"{', '.join('#' + q for q in queries[:4])}"
+                 + (" ..." if len(queries) > 4 else ""), killfeed.INFO)
+
+        handles, walls = [], 0
+        for index, query in enumerate(queries, start=1):
+            if job.cancelled or len(handles) >= max_results:
+                break
+            page = _tt_fetch(f"https://www.tiktok.com/tag/{quote_plus(query)}",
+                             cfg, ghost, job=job)
+            if _tt_walled(page):
+                walls += 1
+                job.report(current=index, log=f"#{query} hit the TikTok login wall")
+                continue
+            fresh = [h for h in dict.fromkeys(_TT_ID_RE.findall(page.html_content))
+                     if h not in handles]
+            handles.extend(fresh)
+            job.report(current=index,
+                       message=f"{len(handles)} profiles from {index}/{len(queries)} tags")
+            announce(f"HARVESTED {len(fresh):>3} profiles from TikTok #{query} "
+                     f"({len(handles)} total)",
+                     killfeed.OK if fresh else killfeed.WARN)
+
+        handles = handles[:max_results]
+        if not handles:
+            # TikTok gates every anonymous visitor, so this is the expected
+            # path rather than an edge case, and the fix is a stored session.
+            if walls:
+                raise LoginRequired(TIKTOK_WALL_HINT)
+            job.report(message=f"No accounts surfaced for '{seed}'")
+            return []
 
     known = load_known(skip_known, job)
     job.report(total=len(handles), current=0, message=f"Reading {len(handles)} bios")

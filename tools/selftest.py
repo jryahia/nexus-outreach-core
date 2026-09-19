@@ -1505,6 +1505,209 @@ check("blank keyword returns nothing, offline",
       hunter.scrape_reddit(job=Job(key="t"), cfg=cfg, target="  ") == []
       and hunter.scrape_discord(job=Job(key="t"), cfg=cfg, target="") == [])
 
+# ---------------------------------------------------------------------------
+print("\nsmart query expansion")
+_q = hunter.expand_queries("video editor")
+check("a niche becomes several tags", len(_q) > 1, str(_q[:4]))
+check("the typed niche leads", _q[0] == "videoeditor", _q[0])
+check("spaces and punctuation are stripped",
+      hunter.expand_queries("Real-Estate!")[0] == "realestate")
+# "video editor" + "editor" is a tag nobody uses; it must not cost a page load.
+check("a term already in the niche is not appended",
+      "videoeditoreditor" not in _q)
+check("no duplicates survive", len(_q) == len(set(_q)))
+check("the variant budget is respected",
+      len(hunter.expand_queries("drone", limit=3)) == 3)
+check("an empty niche costs nothing", hunter.expand_queries("   ") == [])
+check("a niche with no letters costs nothing", hunter.expand_queries("!!!") == [])
+
+# ---------------------------------------------------------------------------
+print("\ninfinite scroll")
+
+
+class _ScrollPage:
+    """A page whose markup either grows on scroll or does not."""
+
+    def __init__(self, sizes):
+        self.sizes = list(sizes)
+        self.reads = 0
+        self.scrolls = 0
+
+    def evaluate(self, script):
+        if "scrollBy" in script:
+            self.scrolls += 1
+            return None
+        size = self.sizes[min(self.reads, len(self.sizes) - 1)]
+        self.reads += 1
+        return size
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+
+_flat = _ScrollPage([989905] * 6)          # measured: a walled hashtag page
+hunter.scroll_until_stale(Job(key="t"), rounds=5, pause=0)(_flat)
+check("a page that does not grow is scrolled once, not five times",
+      _flat.scrolls == 1, f"{_flat.scrolls} scrolls")
+
+_growing = _ScrollPage([100, 200, 300, 400, 500, 600])
+_act = hunter.scroll_until_stale(Job(key="t"), rounds=5, pause=0)
+_act(_growing)
+check("a feed that does grow is unrolled to the round cap",
+      _growing.scrolls == 5, f"{_growing.scrolls} scrolls")
+check("the rounds used are reported back", _act.rounds_used == 5, _act.rounds_used)
+
+_stalls = _ScrollPage([100, 200, 200, 200])
+hunter.scroll_until_stale(Job(key="t"), rounds=5, pause=0)(_stalls)
+check("scrolling stops on the first round that adds nothing",
+      _stalls.scrolls == 2, f"{_stalls.scrolls} scrolls")
+
+_cancelled = Job(key="t")
+_cancelled.stop_event.set()
+_quit = _ScrollPage([100, 200, 300, 400])
+hunter.scroll_until_stale(_cancelled, rounds=5, pause=0)(_quit)
+check("a cancelled hunt stops scrolling immediately", _quit.scrolls == 0)
+
+
+class _Boom:
+    def evaluate(self, script):
+        raise RuntimeError("navigation destroyed the context")
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+
+check("a page that dies mid-scroll does not take the hunt with it",
+      hunter.scroll_until_stale(Job(key="t"), rounds=3, pause=0)(_Boom()) is not None)
+
+# ---------------------------------------------------------------------------
+print("\nbulk harvesting")
+
+
+class _FakePage:
+    def __init__(self, handles=(), key="username", url="https://x/", title="Tag"):
+        self.status = 200
+        self.url = url
+        self.html_content = "{" + ",".join(
+            '"%s":"%s"' % (key, h) for h in handles) + "}"
+        self._title = title
+
+    def css(self, _selector):
+        return [self._title]
+
+
+def _serve(pages):
+    """A fetcher that hands back canned pages and records every url asked for."""
+    seen = []
+
+    def fetch(url, **kwargs):
+        seen.append(url)
+        for fragment, page in pages.items():
+            if fragment in url:
+                return page
+        return _FakePage()
+
+    fetch.seen = seen
+    return fetch
+
+
+def _stub_profile(handle, cfg, job, ghost=False):
+    lead = hunter._blank_lead("TikTok")
+    lead.update(name=handle, handle=f"@{handle}", email=f"{handle}@example.com")
+    return lead
+
+
+_real_fetch = hunter.StealthyFetcher.fetch
+_real_tt_profile = hunter._tt_profile
+_real_ig_profile = hunter._ig_profile
+try:
+    hunter._tt_profile = _stub_profile
+    hunter._ig_profile = _stub_profile
+
+    # Two tags, overlapping rosters. The point of sweeping is the union.
+    # Longest fragment first: "/tag/drone" is a prefix of "/tag/droneeditor".
+    _fetcher = _serve({
+        "/tag/droneeditor": _FakePage(["bob", "carol"], key="uniqueId"),
+        "/tag/drone": _FakePage(["alice", "bob"], key="uniqueId"),
+    })
+    hunter.StealthyFetcher.fetch = _fetcher
+    _leads = hunter.scrape_tiktok(job=Job(key="t"), cfg=cfg, target="drone",
+                                  max_results=40, skip_known=False)
+    _handles = [lead["handle"] for lead in _leads]
+    check("one niche visits several TikTok tags",
+          len([u for u in _fetcher.seen if "/tag/" in u]) > 1,
+          f"{len([u for u in _fetcher.seen if '/tag/' in u])} tags")
+    check("a handle seen on two tags is harvested once",
+          _handles.count("@bob") == 1, str(_handles))
+    check("the sweep returns the union, not one page",
+          set(_handles) >= {"@alice", "@bob", "@carol"}, str(sorted(_handles)))
+
+    # The cap is a budget: it must stop the sweep, not just trim the output.
+    _fetcher = _serve({"/tag/": _FakePage([f"u{i}" for i in range(50)],
+                                          key="uniqueId")})
+    hunter.StealthyFetcher.fetch = _fetcher
+    _leads = hunter.scrape_tiktok(job=Job(key="t"), cfg=cfg, target="drone",
+                                  max_results=30, skip_known=False)
+    check("the harvest stops at the cap", len(_leads) == 30, len(_leads))
+    check("the cap ends the sweep instead of loading every tag",
+          len([u for u in _fetcher.seen if "/tag/" in u]) == 1)
+
+    # A single account is a lookup, not a sweep: one page load, no tag pages.
+    _fetcher = _serve({})
+    hunter.StealthyFetcher.fetch = _fetcher
+    _leads = hunter.scrape_tiktok(job=Job(key="t"), cfg=cfg, target="@someone",
+                                  max_results=40, skip_known=False)
+    check("an @account stays a single lookup",
+          [lead["handle"] for lead in _leads] == ["@someone"]
+          and not [u for u in _fetcher.seen if "/tag/" in u],
+          str([lead["handle"] for lead in _leads]))
+
+    # TikTok walls every anonymous visitor, so the message has to name the fix.
+    hunter.StealthyFetcher.fetch = _serve({
+        "tiktok.com": _FakePage([], key="uniqueId", title="Log in | TikTok")})
+    try:
+        hunter.scrape_tiktok(job=Job(key="t"), cfg=cfg, target="drone",
+                             max_results=40, skip_known=False)
+        _raised = ""
+    except hunter.LoginRequired as exc:
+        _raised = str(exc)
+    check("a fully walled TikTok sweep says so", bool(_raised))
+    check("and names the login tool, not just the failure",
+          "tiktok_login.py" in _raised)
+
+    # Instagram: same sweep, and one gated tag must not lose the tags that worked.
+    _fetcher = _serve({
+        "/tags/droneeditor/": _FakePage(["dana", "erin"]),
+        "/tags/drone/": _FakePage([], url="https://www.instagram.com/accounts/login/"),
+    })
+    hunter.StealthyFetcher.fetch = _fetcher
+    _leads = hunter.scrape_instagram(job=Job(key="t"), cfg=cfg, target="drone",
+                                     max_results=40, skip_known=False)
+    check("one gated tag does not sink the whole Instagram sweep",
+          {lead["handle"] for lead in _leads} >= {"@dana", "@erin"},
+          str(sorted(lead["handle"] for lead in _leads)))
+
+    hunter.StealthyFetcher.fetch = _serve({
+        "instagram.com": _FakePage([], url="https://www.instagram.com/accounts/login/")})
+    try:
+        hunter.scrape_instagram(job=Job(key="t"), cfg=cfg, target="drone",
+                                max_results=40, skip_known=False)
+        _raised = ""
+    except hunter.LoginRequired as exc:
+        _raised = str(exc)
+    check("every Instagram tag gated raises, with the rate-limit fix named",
+          "NEXUS_PROXY" in _raised, _raised[:48])
+
+    # Tags with no accounts are not a wall, and must not be reported as one.
+    hunter.StealthyFetcher.fetch = _serve({"instagram.com": _FakePage([])})
+    check("tags with no accounts return empty rather than raising",
+          hunter.scrape_instagram(job=Job(key="t"), cfg=cfg, target="drone",
+                                  max_results=40, skip_known=False) == [])
+finally:
+    hunter.StealthyFetcher.fetch = _real_fetch
+    hunter._tt_profile = _real_tt_profile
+    hunter._ig_profile = _real_ig_profile
+
 for suffix in ("", "-wal", "-shm"):
     Path(str(TEST_DB) + suffix).unlink(missing_ok=True)
 print("\n" + ("ALL PASS" if not FAILURES else f"{len(FAILURES)} FAILED: {FAILURES}"))

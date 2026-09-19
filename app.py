@@ -327,11 +327,22 @@ def tab_hunt() -> None:
         )
     else:
         target = st.text_input(
-            "Hashtag or account", placeholder="#realestateagent  or  @someaccount"
+            "Niche, hashtag, or account",
+            placeholder="real estate  or  #realestateagent  or  @someaccount",
         )
         args = {"target": target}
         fn = hunter.scrape_instagram if source == "Instagram" else hunter.scrape_tiktok
         ready = bool(target)
+        # One tag returns about ten public accounts and then stops, however far
+        # it is scrolled, so a niche is swept across several related tags. Show
+        # the operator exactly which ones before they spend the page loads.
+        variants = hunter.expand_queries(target)
+        if target.strip().startswith("@") and " " not in target.strip():
+            st.caption("Single account lookup. Enter a niche instead to sweep "
+                       "several hashtags in one hunt.")
+        elif len(variants) > 1:
+            st.caption("Sweeping " + str(len(variants)) + " hashtags: "
+                       + ", ".join("#" + v for v in variants))
 
     ghost_col, _ = st.columns([3, 2])
     with ghost_col:
