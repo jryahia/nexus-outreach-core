@@ -739,7 +739,6 @@ _CSS = f"""
       right: 18px;
       bottom: 92px;
       pointer-events: auto;
-      cursor: pointer;
       font-size: 9px;
       letter-spacing: 0.18em;
       padding: 5px 9px;
@@ -795,38 +794,65 @@ _CSS = f"""
   }}
 
   /* ---- Crosshair cursor --------------------------------------------------- */
-  /* A 24px reticle: thin ring, centre dot, four ticks. Inline SVG rather than
-     an asset, so it costs no request and inherits no cache. The hotspot is the
-     centre (12,12), which is the only sane choice for a crosshair - an offset
-     one makes every click feel like it landed somewhere else.
-     A custom cursor is a readability hazard as much as a flourish, so it is
-     scoped: anything you type into keeps its I-beam, anything you press keeps
-     its hand, and the data grid keeps its own. A crosshair over a text field
-     hides the caret, which is the fastest way to make an interface feel
-     broken. */
-  .stApp {{
-      cursor: url("data:image/svg+xml;utf8,\
+  /* The reticle and the HUD I-beam, defined once and referenced everywhere.
+     Inline SVG data URIs, so they cost no request. Hotspots are dead centre
+     (12,12): an offset hotspot makes every click feel like it landed
+     somewhere other than where it was aimed. */
+  :root {{
+      --nx-reticle: url("data:image/svg+xml;utf8,\
 <svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'>\
 <circle cx='12' cy='12' r='8' fill='none' stroke='%2300f3ff' stroke-width='1' opacity='0.85'/>\
 <circle cx='12' cy='12' r='1.6' fill='%2300f3ff'/>\
 <path d='M12 0v4M12 20v4M0 12h4M20 12h4' stroke='%2300f3ff' stroke-width='1' opacity='0.7'/>\
 </svg>") 12 12, crosshair;
+      /* The typing cursor: a cyan bar with serifs, so a text field still reads
+         as a text field without handing the native I-beam back. */
+      --nx-ibeam: url("data:image/svg+xml;utf8,\
+<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'>\
+<path d='M12 4v16' stroke='%2300f3ff' stroke-width='1.4' opacity='0.95'/>\
+<path d='M8 4h8M8 20h8' stroke='%2300f3ff' stroke-width='1.2' opacity='0.8'/>\
+<circle cx='12' cy='12' r='1' fill='%2300f3ff' opacity='0.9'/>\
+</svg>") 12 12, text;
   }}
-  /* Typing surfaces keep the caret they need. */
-  .stApp input, .stApp textarea, .stApp [contenteditable="true"],
-  [data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"] {{
-      cursor: text;
+
+  /* Everything, in every state. The native pointer was never a flash: it was
+     this stylesheet handing control back. Buttons, tabs, sliders and links
+     were set to `pointer`, which IS the operating system hand, and html, body
+     and the body-level overlays were never claimed at all, so they fell
+     through to the arrow. Both are closed here.
+     The universal selector is deliberate. A HUD that drops the reticle over
+     one unclaimed element breaks the illusion exactly as badly as one that
+     drops it everywhere, and new elements arrive with every Streamlit
+     release. */
+  *, *::before, *::after,
+  *:hover, *:active, *:focus, *:focus-visible, *:disabled {{
+      cursor: var(--nx-reticle) !important;
   }}
-  /* Anything pressable keeps the hand, so affordance survives the theme. */
-  .stApp button, .stApp a, .stApp select, .stApp summary,
-  .stApp [role="tab"], .stApp [role="option"], .stApp [role="button"],
-  [data-testid="stSlider"], [data-testid="stButtonGroup"] button,
-  .nx-visor .mute {{
-      cursor: pointer;
+
+  /* Typing surfaces keep a caret - the HUD one. Listed after the universal
+     rule so it wins at equal specificity. */
+  /* Named rather than excluded. A blacklist let input[type=range] through and
+     put a text caret on the sliders; listing the types that are actually
+     typed into cannot drift that way when a new input type appears. */
+  input[type="text"], input[type="text"]:hover, input[type="text"]:focus,
+  input[type="email"], input[type="search"], input[type="password"],
+  input[type="number"], input[type="tel"], input[type="url"],
+  input:not([type]), input:not([type]):hover, input:not([type]):focus,
+  textarea, textarea:hover, textarea:focus,
+  [contenteditable="true"], [contenteditable="true"]:hover,
+  [data-testid="stTextInputRootElement"], [data-testid="stTextInputRootElement"] *,
+  [data-testid="stTextAreaRootElement"], [data-testid="stTextAreaRootElement"] * {{
+      cursor: var(--nx-ibeam) !important;
   }}
-  /* The grid manages its own cursors for resizing and selection. */
-  [data-testid="stDataFrame"], [data-testid="stDataFrame"] * {{
-      cursor: auto;
+
+  /* Cursors that carry information rather than affordance stay as they are.
+     col-resize on a grid edge tells the operator a column can be dragged;
+     replacing it with a reticle removes a control, which is a different
+     problem from the one being fixed here. */
+  [data-testid="stDataFrame"] [class*="resize"],
+  [class*="col-resize"], [class*="row-resize"],
+  .nx-resize-handle {{
+      cursor: col-resize !important;
   }}
 
   /* ---- Click pulse --------------------------------------------------------- */
@@ -1312,7 +1338,9 @@ _CSS = f"""
       canvas.nx-canvas, canvas.nx-core, .nx-spot {{ display: none; }}
       #kill-feed .ln {{ animation: none; }}
       .nx-pulse-ring {{ display: none; }}
-      .stApp {{ cursor: auto; }}
+      /* A custom cursor is motion the operator did not ask for. */
+      *, *:hover, *:active, *:focus {{ cursor: auto !important; }}
+      input, textarea, [contenteditable="true"] {{ cursor: text !important; }}
       .nx-boot {{ display: none; }}
       .nx-crt::after {{ display: none; }}
       div[data-testid="stMetric"], div[data-testid="stDataFrame"] {{
