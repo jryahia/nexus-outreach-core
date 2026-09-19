@@ -294,6 +294,7 @@ class AppConfig:
     ig_profile_dir: str = ""
     # Ghost Protocol. A proxy string Scrapling understands, or "" for none.
     proxy: str = ""
+    solve_challenges: bool = True
     # The Outpost. Treated as a credential: it usually embeds an auth token.
     webhook_url: str = ""
     webhook_detail: bool = False
@@ -381,6 +382,7 @@ def load_config(refresh: bool = True) -> AppConfig:
         headless=_bool("HEADLESS", True),
         request_timeout=_int("REQUEST_TIMEOUT", 30000),
         proxy=os.getenv("NEXUS_PROXY", "").strip(),
+        solve_challenges=_bool("NEXUS_SOLVE_CHALLENGES", True),
         webhook_url=os.getenv("NEXUS_WEBHOOK_URL", "").strip(),
         webhook_detail=_bool("NEXUS_WEBHOOK_DETAIL", False),
         tiktok_profile_dir=os.getenv("TIKTOK_PROFILE_DIR", "").strip(),

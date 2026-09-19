@@ -19,7 +19,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 
 from scrapling.fetchers import Fetcher, StealthyFetcher
 
-from core import killfeed, outpost, vault
+from core import enrich, killfeed, outpost, vault
 from core.config import AppConfig
 from core.purifier import (
     LEAD_FIELDS,
@@ -181,6 +181,22 @@ def stealth_kwargs(cfg: AppConfig, ghost: bool = False) -> dict:
         "disable_resources": True,   # fewer requests, smaller fingerprint
         "allow_webgl": True,         # deliberately ON: absent WebGL flags a bot
     }
+    # No JavaScript hardening is injected, and that is a finding rather than
+    # an omission. Measured on this build: navigator.webdriver already reads
+    # false, window.chrome is a real object, navigator.plugins is a populated
+    # PluginArray, and WebGL reports the actual adapter - patchright removes
+    # those leaks at driver level, below anything a page can inspect.
+    # Re-patching them in JS would swap a clean native value for a property
+    # descriptor that fingerprinting scripts can detect. Scrapling's own
+    # init_script hook was tried as the pre-navigation seam and does not fire
+    # in 0.4.15: a trivial marker script never reached the page.
+    #
+    # Scrapling can sit through a Turnstile or interstitial rather than
+    # returning the challenge page as if it were the site. This is the real
+    # answer to "never get a captcha", and it costs time, so it is only on
+    # while Ghost is.
+    if cfg.solve_challenges:
+        extra["solve_cloudflare"] = True
     if cfg.has_proxy:
         extra["proxy"] = cfg.proxies[0]
     return extra
@@ -248,7 +264,8 @@ def _domain(url: str) -> str:
 # ---------------------------------------------------------------------------
 # Website email discovery - the step that makes Maps leads usable for B2B
 # ---------------------------------------------------------------------------
-def emails_from_website(url: str, *, timeout: int = 20, job: Any = None) -> list[str]:
+def emails_from_website(url: str, *, timeout: int = 20, job: Any = None,
+                        collect: dict | None = None) -> list[str]:
     """Visit a business site and its contact pages, harvest addresses.
 
     Plain HTTP with browser TLS impersonation, not a headless browser: these
@@ -280,6 +297,12 @@ def emails_from_website(url: str, *, timeout: int = 20, job: Any = None) -> list
             continue
 
         html = page.html_content
+        # Handed back to the caller for the semantic pass: the decision-maker
+        # heuristic needs the markup around an address, not the address alone.
+        # A per-call dict rather than state on the job, because several leads
+        # are enriched at once and they would overwrite each other's page.
+        if collect is not None and "html" not in collect:
+            collect["html"] = html
         candidates = _MAILTO_RE.findall(html) + extract_emails(html)
         for addr in extract_emails(" ".join(candidates)):
             if addr not in seen:
@@ -305,6 +328,103 @@ def _rank_emails(emails: list[str], site_domain: str) -> list[str]:
     return sorted(dict.fromkeys(emails), key=score)
 
 
+def _follow_bio_link(url: str, cfg: AppConfig, job: Any,
+                     ghost: bool = False) -> tuple[list[str], list[str]]:
+    """Open a link-in-bio page and report what it points at.
+
+    These pages are React shells: a plain HTTP fetch returns a few kilobytes of
+    loader and no links at all, measured on both Linktree and Beacons. So this
+    is the one enrichment path that is worth a browser, and it is only ever
+    taken for hosts on the bio-link list.
+
+    Returns (emails found on the page itself, destinations worth following).
+    """
+    try:
+        page = StealthyFetcher.fetch(
+            url,
+            headless=cfg.headless,
+            timeout=max(cfg.request_timeout, 60000),
+            network_idle=True,          # the buttons arrive after first paint
+            wait=2500,
+            google_search=True,
+            **stealth_kwargs(cfg, ghost),
+        )
+    except Exception as exc:
+        job.report(log=f"  bio-link {url} failed ({type(exc).__name__})")
+        return [], []
+
+    html = page.html_content
+    emails = enrich.mailtos(html) + extract_emails(html)
+    links = enrich.outbound_links(page, url)
+    sites = [link for link in links if not link.startswith("mailto:")]
+    for mail in links:
+        if mail.startswith("mailto:"):
+            emails.extend(enrich.mailtos(mail))
+    return list(dict.fromkeys(emails)), sites
+
+
+def deep_enrich(lead: dict, cfg: AppConfig, job: Any,
+                ghost: bool = False) -> dict:
+    """Resolve one lead's contact, following a bio-link page if that is what
+    the target actually has.
+
+    Ordinary sites keep the cheap path: an HTTP crawl of the contact pages.
+    A Linktree or a Beacons page gets one browser hop, and whatever it points
+    at is then crawled the cheap way - which is where a creator's booking
+    address usually lives.
+    """
+    site = (lead.get("website") or "").strip()
+    if not site:
+        return lead
+
+    found: dict = {}
+    markup: dict = {}
+    if enrich.is_bio_link(site):
+        announce(f"DEEP     {lead.get('name', site)} -> bio-link, following",
+                 killfeed.INFO)
+        emails, destinations = _follow_bio_link(site, cfg, job, ghost)
+        if emails:
+            lead["email"] = emails[0]
+        for destination in destinations[:3]:
+            if lead.get("email"):
+                break
+            try:
+                hop = emails_from_website(
+                    destination, timeout=max(10, cfg.request_timeout // 1000),
+                    job=job)
+            except Exception:
+                hop = []
+            if hop:
+                lead["email"] = hop[0]
+                lead.setdefault("category", "")
+                job.report(log=f"  via bio-link -> {destination} -> {hop[0]}")
+    else:
+        try:
+            emails = emails_from_website(
+                site, timeout=max(10, cfg.request_timeout // 1000), job=job,
+                collect=markup)
+        except Exception as exc:
+            job.report(log=f"  {site} failed ({type(exc).__name__})")
+            emails = []
+        if emails:
+            lead["email"] = emails[0]
+
+    # Who is this? Only worth asking once an address exists, and only when the
+    # crawl actually handed back a page to read.
+    if lead.get("email") and markup.get("html"):
+        found = enrich.extract_decision_maker(markup["html"], url=site)
+        if found.get("email"):
+            lead["email"] = found["email"]
+        if found.get("name") and not lead.get("contact_name"):
+            lead["contact_name"] = found["name"]
+        if found.get("role"):
+            lead["contact_role"] = found["role"]
+        line = enrich.summarise(found)
+        if line:
+            announce(f"TARGET   {line}", killfeed.OK)
+    return lead
+
+
 # How many targets are enriched at once. Each one is a small HTTP crawl of a
 # business site, so the ceiling is politeness rather than memory: five parallel
 # requests to five different domains is ordinary traffic, and the same five
@@ -325,14 +445,9 @@ async def _enrich_one(lead: dict, cfg: AppConfig, job: Any, semaphore,
         if job.cancelled or not lead.get("website"):
             return lead
         try:
-            emails = await asyncio.to_thread(
-                emails_from_website, lead["website"],
-                timeout=max(10, cfg.request_timeout // 1000), job=job)
+            await asyncio.to_thread(deep_enrich, lead, cfg, job, ghost)
         except Exception as exc:
             job.report(log=f"  {lead['website']} failed ({type(exc).__name__})")
-            return lead
-        if emails:
-            lead["email"] = emails[0]
     return lead
 
 

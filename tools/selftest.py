@@ -869,6 +869,149 @@ check("dry run logged, nothing sent",
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+print("\ndecision-maker extraction")
+from core import enrich  # noqa: E402
+
+_TEAM_PAGE = """<html><body>
+  <div class="team">
+    <h3>Anna Rossi</h3><p>Founder &amp; Creative Director</p>
+    <a href="mailto:anna.rossi@tonefilms.it">anna.rossi@tonefilms.it</a>
+  </div>
+  <footer>General enquiries: info@tonefilms.it</footer>
+  <script>var tracker = "noise@segment.io";</script>
+</body></html>"""
+
+_who = enrich.extract_decision_maker(_TEAM_PAGE)
+# The whole point: a named founder beats the shared inbox on the same page.
+check("the named human wins over the shared inbox",
+      _who["email"] == "anna.rossi@tonefilms.it", _who["email"])
+check("the role is read from the text beside the address",
+      _who["role"] == "Founder", _who["role"])
+check("the name is read too", _who["name"] == "Anna Rossi", _who["name"])
+check("confidence rises with what was found", _who["confidence"] > 0.9,
+      str(_who["confidence"]))
+check("script noise never becomes a contact",
+      "segment.io" not in str(_who))
+check("the kill-feed line names the person",
+      enrich.summarise(_who) == "Found Founder: Anna Rossi - anna.rossi@tonefilms.it",
+      enrich.summarise(_who))
+
+# lxml's text_content() runs block elements together, which would turn
+# "<h3>Anna Rossi</h3><p>Founder</p>" into "Anna RossiFounder" and make every
+# team page unreadable. This is the regression that guards the separator.
+check("block elements stay separated",
+      "Anna Rossi" in enrich._strip_markup("<h3>Anna Rossi</h3><p>Founder</p>"),
+      enrich._strip_markup("<h3>Anna Rossi</h3><p>Founder</p>"))
+
+_generic = enrich.extract_decision_maker(
+    "<html><body><p>Contact us: info@agency.com</p></body></html>")
+check("a shared inbox is still returned when it is all there is",
+      _generic["email"] == "info@agency.com" and _generic["confidence"] < 0.5,
+      str(_generic))
+check("a page with no address yields nothing",
+      enrich.extract_decision_maker("<html><body>no contact</body></html>")["email"]
+      == "")
+
+# Job titles are shaped exactly like names, and contact blocks open with verbs.
+check("a job title is never mistaken for a name",
+      enrich.name_near("Creative Director", "x@y.com") == "")
+check("a leading verb is trimmed off a name",
+      enrich.name_near("Contact Marco Bianchi today", "marco.bianchi@x.it")
+      == "Marco Bianchi")
+check("the address corroborates which name to take",
+      enrich.name_near("Sofia Lopez and Jane Smith", "jane.smith@x.com")
+      == "Jane Smith")
+check("the most senior title wins",
+      enrich.role_near("Founder and Creative Director") == "Founder")
+
+# The seam a model plugs into: same signature, same shape, one swap.
+def _model(html, url):
+    return {"name": "Marco Bianchi", "email": "marco@studio.it",
+            "role": "CEO", "confidence": 0.96}
+
+
+_via_model = enrich.extract_decision_maker(_TEAM_PAGE, extractor=_model)
+check("an extractor takes over when one is given",
+      _via_model["email"] == "marco@studio.it" and _via_model["source"] == "model",
+      str(_via_model))
+
+
+def _broken_model(html, url):
+    raise RuntimeError("API unavailable")
+
+
+check("a failing extractor falls back rather than losing the lead",
+      enrich.extract_decision_maker(_TEAM_PAGE, extractor=_broken_model)["email"]
+      == "anna.rossi@tonefilms.it")
+
+
+def _partial_model(html, url):
+    return {"email": "someone@studio.it"}
+
+
+_partial = enrich.extract_decision_maker(_TEAM_PAGE, extractor=_partial_model)
+check("the heuristic completes what a model leaves blank",
+      _partial["role"] == "Founder", str(_partial))
+
+# ---------------------------------------------------------------------------
+print("\nbio-link traversal")
+for _host in ("https://linktr.ee/someone", "https://beacons.ai/x",
+              "https://bento.me/y", "https://campsite.bio/z"):
+    check(f"{enrich.host_of(_host)} is treated as a bio-link",
+          enrich.is_bio_link(_host))
+check("an ordinary site is not a bio-link",
+      not enrich.is_bio_link("https://tonefilms.com/contact"))
+check("a social profile is recognised separately",
+      enrich.is_social("https://instagram.com/someone")
+      and not enrich.is_bio_link("https://instagram.com/someone"))
+check("www is ignored when matching a host",
+      enrich.host_of("https://www.linktr.ee/x") == "linktr.ee")
+check("mailto links are decoded",
+      enrich.mailtos('<a href="mailto:hi@x.com?subject=Hello">c</a>') == ["hi@x.com"])
+
+
+class _FakePage:
+    """Minimal stand-in for a parsed page: just anchors."""
+
+    def __init__(self, hrefs):
+        self._hrefs = hrefs
+
+    def css(self, _selector):
+        return [type("A", (), {"attrib": {"href": h}})() for h in self._hrefs]
+
+
+_links = enrich.outbound_links(
+    _FakePage(["https://studio.example/work", "/about", "#top",
+               "javascript:void(0)", "mailto:book@studio.example",
+               "https://linktr.ee/other", "https://beacons.ai/self"]),
+    "https://beacons.ai/self")
+check("destinations off the bio page are followed",
+      "https://studio.example/work" in _links, str(_links))
+check("a mailto on the bio page is kept", "mailto:book@studio.example" in _links)
+check("links back to the same host are ignored",
+      not any("beacons.ai" in link for link in _links), str(_links))
+# A bio page linking another bio page is a loop, not a lead.
+check("bio pages are not followed into each other",
+      not any("linktr.ee" in link for link in _links), str(_links))
+check("anchors and scripts are ignored",
+      not any(link.startswith(("#", "javascript:")) for link in _links))
+
+# ---------------------------------------------------------------------------
+print("\nstealth posture")
+_ghost = hunter.stealth_kwargs(AppConfig(), True)
+# Challenge solving is the real anti-captcha lever; JS hardening is not, and
+# the comment in stealth_kwargs records why.
+check("ghost sits through a Cloudflare challenge",
+      _ghost.get("solve_cloudflare") is True, str(_ghost))
+check("challenge solving can be turned off",
+      "solve_cloudflare" not in hunter.stealth_kwargs(
+          AppConfig(solve_challenges=False), True))
+check("no JavaScript hardening is injected",
+      "init_script" not in _ghost, str(sorted(_ghost)))
+check("stealth stays off when ghost is off",
+      hunter.stealth_kwargs(AppConfig(), False) == {})
+
 print("\nzero-bounce armour")
 _MX_FIXTURE = {
     ("live.test", "MX"): ["10 mx.live.test."],
@@ -999,7 +1142,13 @@ _seen_parallel = {"peak": 0, "now": 0}
 _par_lock = threading.Lock()
 
 
-def _slow_crawl(url, timeout=20, job=None):
+def _slow_crawl(url, timeout=20, job=None, collect=None):
+    # collect is the markup the semantic pass reads; the stub hands back a page
+    # with a named contact so the decision-maker path is exercised too.
+    if collect is not None:
+        collect["html"] = ("<html><body><h3>Sofia Lopez</h3><p>Founder</p>"
+                           "<a href='mailto:sofia@site.test'>sofia@site.test</a>"
+                           "</body></html>")
     with _par_lock:
         _seen_parallel["now"] += 1
         _seen_parallel["peak"] = max(_seen_parallel["peak"], _seen_parallel["now"])
