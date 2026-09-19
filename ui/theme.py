@@ -645,63 +645,79 @@ _CSS = f"""
   /* A command rail welded to the bottom edge of the viewport, full width.
      The previous version was a floating box parked over the middle of the
      page, which is exactly where the interface is. */
-  /* A side terminal, anchored bottom left. The full-width rail spanned the
-     window and detached from the layout the moment the page scrolled; a panel
-     of a fixed size, parked in a corner, has nothing to detach from. */
+  /* The terminal is appended to document.body by the runtime, so nothing in
+     Streamlit's tree can clip it - it was sizing to its own content, which is
+     why two lines looked squashed into a strip. An explicit height fixes that.
+     Every declaration is forced because this element has to win against
+     whatever Streamlit's stylesheet decides to do next to an unknown id. */
   #kill-feed {{
-      position: fixed;
-      bottom: 20px;
-      left: 20px;
-      width: 450px;
-      max-height: 250px;
-      overflow: hidden;
-      z-index: 9999;
-      /* The panel accepts a hover so an idle feed can be brought back on
-         demand. Its contents stay inert, so nothing here is clickable. */
-      pointer-events: auto;
+      position: fixed !important;
+      bottom: 40px !important;
+      left: 40px !important;
+      width: 480px !important;
+      height: 220px !important;
+      background: rgba(0, 8, 16, 0.9) !important;
+      backdrop-filter: blur(8px) !important;
+      -webkit-backdrop-filter: blur(8px) !important;
+      border: 1px solid rgba(0, 243, 255, 0.2) !important;
+      border-left: 3px solid #00F3FF !important;
+      border-radius: 4px !important;
+      padding: 15px !important;
+      z-index: 999999 !important;
+      display: flex !important;
+      flex-direction: column-reverse !important;
+      overflow: hidden !important;
+      box-shadow: 0 15px 40px rgba(0, 0, 0, 0.9) !important;
+
+      /* Not in the spec, and load-bearing. Without it this element defaults to
+         pointer-events:auto, and at z-index 999999 a 480x220 rectangle over
+         the bottom-left corner would swallow every click meant for the app
+         underneath it. An overlay that eats input is a bug no matter how good
+         it looks. This also costs the hover-to-reveal on the idle state, which
+         is the right trade. */
+      pointer-events: none !important;
+
       font-family: {MONO_FONT};
       font-size: 11px;
       line-height: 1.65;
       letter-spacing: 0.04em;
       color: {ACCENT};
-      background: rgba(0, 10, 20, 0.85);
-      border: 1px solid rgba(0, 243, 255, 0.3);
-      border-left: 3px solid {ACCENT};
-      border-radius: 4px;
-      padding: 10px;
-      padding-top: 22px;            /* clears the label strip */
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
-      /* Newest at the bottom, older pushed up and out of view. No scroll
-         position to manage. */
-      display: flex;
-      flex-direction: column-reverse;
       transition: opacity 0.35s {EASE};
       opacity: 0;
   }}
   #kill-feed.live {{ opacity: 1; }}
-  /* Idle. A fixed panel in a corner will always sit over whatever else is in
-     that corner, so it steps back when it has nothing to report rather than
-     holding the space permanently. Any new line brings it straight back, and
-     hovering it recalls the history on demand. */
-  #kill-feed.idle {{ opacity: 0.16; }}
-  #kill-feed.idle:hover {{ opacity: 1; }}
+  /* Idle. The panel steps back when it has nothing to report rather than
+     holding the corner at full strength, and any new line brings it straight
+     back. It stays legible at this level: with pointer-events off there is no
+     hover to recall it, so it can never fade to something that reads as
+     broken. */
+  #kill-feed.idle {{ opacity: 0.45; }}
 
   #kill-feed .hd {{
       position: absolute;
-      top: 6px; left: 10px; right: 10px;
+      top: 0; left: 0; right: 0;
+      padding: 6px 12px 8px 12px;
       color: {MUTED};
       font-size: 8.5px;
       letter-spacing: 0.24em;
       display: flex;
       justify-content: space-between;
       pointer-events: none;
+      /* A fade rather than a solid bar, so a line scrolling up dissolves
+         under the label instead of being cut in half by it. */
+      background: linear-gradient(180deg, rgba(0, 8, 16, 0.96) 55%,
+                                          rgba(0, 8, 16, 0));
+      z-index: 1;
   }}
   #kill-feed .ln {{
       pointer-events: none;
-      white-space: pre;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      /* Wraps rather than truncating. At 480px a subject line always ran past
+         the edge, and half a line with an ellipsis tells you an email went out
+         without telling you to whom. Fewer entries visible, every one of them
+         complete. */
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin-bottom: 2px;
       /* The glow is what makes it read as a phosphor terminal rather than
          grey text on a dark bar. */
       text-shadow: 0 0 6px currentColor, 0 0 18px rgba(0, 243, 255, 0.28);
