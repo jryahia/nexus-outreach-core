@@ -11,6 +11,8 @@ so closing the app or losing power costs nothing.
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 import time
 from datetime import datetime
 
@@ -21,8 +23,9 @@ from streamlit_agraph import Config, Edge, Node, agraph
 
 from core import (
     cannon, diagnostics, envfile, geo, hunter, killfeed, network, outpost,
-    purifier, templates, vault,
+    purifier, social, templates, vault,
 )
+from core import config as config_module
 from core.config import ENV_PATH, load_config
 from ui import globe
 from ui.state import DONE, ERROR, RUNNING, STOPPED, get_job, reset_job, start_job, stop_job
@@ -295,6 +298,31 @@ def type_breakdown(rows: list[dict]) -> None:
 # --------------------------------------------------------------------------
 # Tab 1 - The Hunter
 # --------------------------------------------------------------------------
+def pre_hunt_social_check(source: str) -> None:
+    """Warn, before a hunt starts, if a social session is not signed in.
+
+    TikTok answers every logged-out request with a login wall and Instagram
+    gates most tags, so a hunt on an unconnected session dies deep inside the
+    run. Checked here, with the session cookie (not just the folder), so the
+    warning is honest and the operator can Connect first.
+    """
+    key = {"TikTok": "tiktok", "Instagram": "instagram"}.get(source)
+    if not key:
+        return
+    configured = (cfg.tiktok_profile_dir if key == "tiktok" else cfg.ig_profile_dir)
+    state = social.status(key, configured)
+    if state == social.CONNECTED:
+        st.caption(f":green[:material/check_circle: {source} session "
+                   "authenticated.]")
+    else:
+        st.warning(
+            f"{source} is not signed in on this machine. Logged-out hunts hit a "
+            f"login wall. Open SYSTEM CONTROL and press Connect {source} first - "
+            "the hunt will still run, but it may return nothing until you do.",
+            icon=":material/lock:",
+        )
+
+
 def tab_hunt() -> None:
     job = get_job(HUNT)
 
@@ -367,6 +395,10 @@ def tab_hunt() -> None:
         elif len(variants) > 1:
             st.caption("Sweeping " + str(len(variants)) + " hashtags: "
                        + ", ".join("#" + v for v in variants))
+        # Verify the session before the hunt, not mid-run. TikTok walls every
+        # anonymous visitor and Instagram gates most tags, so an unconnected
+        # session would otherwise fail deep inside the hunt with a login wall.
+        pre_hunt_social_check(source)
 
     # Ghost Protocol is a browser posture. An API source has no browser, so the
     # toggle is hidden rather than shown as a control that would do nothing.
@@ -987,43 +1019,79 @@ def rows_in_zone(rows: list[dict], keys: set[str]) -> list[dict]:
             if geo.normalise((r.get("location") or "")) in keys]
 
 
-def radar_map(points: list[dict], unplaced: list[str]) -> None:
+def radar_map(points: list[dict], unplaced: list[str],
+              rows: list[dict] | None = None) -> None:
     """The holographic target globe: cities as neon points, arcs from the hub.
 
     Rendered by ui.globe in its own iframe - drag to rotate, scroll to dive.
     The globe is display-only (an iframe cannot report a click back to Python),
     so targets are acquired with the picker above it and passed back in as data
-    for the globe to light.
+    for the globe to light. The Targeting Options panel filters what the globe
+    draws by source and sector, recomputing the points client-side of the map.
     """
     if not points:
         st.info("No leads with a recognised city yet.", icon=":material/public:")
         return
 
     zone = st.session_state.get("_zone") or {}
-    captured = zone.get("captured", [])
     keys = zone.get("keys") or set()
+    rows = rows if rows is not None else []
 
-    # The target picker. Its selection is read by resolve_zone at the top of the
-    # next rerun and scopes the CRM grid, the graph and the globe alike.
-    st.multiselect(
-        "Acquire target cities", options=[p["city"] for p in points],
-        key=ZONE_PICK,
-        help="Pick one or more cities to lock a zone. Widen the radius below to "
-             "pull in every city around them. The globe lights what is locked.",
-    )
+    pick_col, filter_col = st.columns([3, 2], gap="large")
 
-    globe.render_globe(points, keys, normalise=geo.normalise, height=720)
+    with filter_col:
+        with st.expander("Targeting options", expanded=False):
+            sources = sorted({(r.get("source") or "").strip()
+                              for r in rows if (r.get("source") or "").strip()})
+            sectors = sorted({(r.get("lead_type") or "").strip()
+                              for r in rows if (r.get("lead_type") or "").strip()})
+            pick_sources = st.multiselect("Source", sources, key="globe_src",
+                                          help="Blank shows every source.")
+            pick_sectors = st.multiselect("Sector", sectors, key="globe_type",
+                                          help="Blank shows every sector.")
+
+    # The filters redraw the globe only; the zone/CRM scope stays on the picker.
+    filtered_rows = globe.filter_rows(rows, pick_sources, pick_sectors)
+    filtered_points, _ = (geo.city_points(filtered_rows)
+                          if (pick_sources or pick_sectors) else (points, []))
+
+    with pick_col:
+        # The target picker. Its selection is read by resolve_zone at the top of
+        # the next rerun and scopes the CRM grid, the graph and the globe alike.
+        st.multiselect(
+            "Acquire target cities", options=[p["city"] for p in points],
+            key=ZONE_PICK,
+            help="Pick one or more cities to lock a zone. Widen the radius below "
+                 "to pull in every city around them. The globe lights what is "
+                 "locked.",
+        )
+
+    globe.render_globe(filtered_points, keys, normalise=geo.normalise, height=720)
+
+    if (pick_sources or pick_sectors):
+        shown_keys = {geo.normalise(p["city"]) for p in filtered_points}
+        st.caption(
+            f":material/filter_alt: Filter active: {len(filtered_points)} of "
+            f"{len(points)} cities shown.")
+        # A filter can hide a city that is still locked in the picker; the CRM
+        # stays scoped to it while the globe shows nothing there. Say so.
+        hidden_picks = [c for c in (st.session_state.get(ZONE_PICK) or [])
+                        if geo.normalise(c) not in shown_keys]
+        if hidden_picks:
+            st.caption(f":material/warning: {', '.join(hidden_picks)} locked but "
+                       "hidden by the filter - still scoping the CRM.")
 
     # Tells the HUD how many targets are inside the zone.
     zone_state(st.session_state.get(ZONE_COUNT))
 
-    if captured:
-        locked = ", ".join(points[i]["city"] for i in captured[:6])
-        more = f" +{len(captured) - 6} more" if len(captured) > 6 else ""
-        total = sum(int(points[i]["leads"]) for i in captured)
+    locked_here = [p for p in filtered_points if geo.normalise(p["city"]) in keys]
+    if locked_here:
+        names = ", ".join(p["city"] for p in locked_here[:6])
+        more = f" +{len(locked_here) - 6} more" if len(locked_here) > 6 else ""
+        total = sum(int(p["leads"]) for p in locked_here)
         st.success(
-            f"Zone acquired: {len(captured)} of {len(points)} cities, "
-            f"{total:,} targets locked. {locked}{more}",
+            f"Zone acquired: {len(locked_here)} of {len(filtered_points)} cities, "
+            f"{total:,} targets locked. {names}{more}",
             icon=":material/my_location:",
         )
     else:
@@ -1032,13 +1100,13 @@ def radar_map(points: list[dict], unplaced: list[str]) -> None:
             "Raise the radius to pull in every city around the ones you picked."
         )
 
-    if len(points) < 2:
+    if len(filtered_points) < 2:
         # The data streams sweep from the busiest city to the others, so a
         # single city has nothing to connect to - say so rather than leave the
         # operator hunting for arcs that cannot exist.
         st.caption(
             "Data-stream arcs appear once two or more cities are on the globe. "
-            "Hunt a second city to draw the network."
+            "Hunt a second city (or widen the filter) to draw the network."
         )
 
     if unplaced:
@@ -1151,7 +1219,8 @@ def tab_network() -> None:
 
     st.divider()
     section("Global radar")
-    radar_map(zone.get("points") or [], zone.get("unplaced") or [])
+    radar_map(zone.get("points") or [], zone.get("unplaced") or [],
+              rows=zone.get("rows") or [])
 
 
 # --------------------------------------------------------------------------
@@ -1407,7 +1476,73 @@ def tab_control() -> None:
             st.error(f"{type(exc).__name__}: {exc}", icon=":material/error:")
 
     st.divider()
+    section("Social sessions")
+    st.caption(
+        "Connect once, in a real browser, and every TikTok or Instagram hunt "
+        "reuses the session. No terminal needed."
+    )
+    for key in ("tiktok", "instagram"):
+        social_connect_row(key)
+
+    st.divider()
     current_settings()
+
+
+# Green / amber / red, by the honest three-state cookie check - never a bare
+# yes/no, because a profile folder exists before anyone signs in.
+_SOCIAL_BADGE = {
+    social.CONNECTED: ("Authenticated", ":material/check_circle:", "green"),
+    social.UNKNOWN: ("Not signed in", ":material/help:", "orange"),
+    social.NOT_SET: ("Disconnected", ":material/cancel:", "red"),
+}
+
+
+def social_connect_row(platform_key: str) -> None:
+    """One platform: its live status and a Connect button that opens a browser."""
+    plat = social.PLATFORMS[platform_key]
+    configured = (cfg.tiktok_profile_dir if platform_key == "tiktok"
+                  else cfg.ig_profile_dir)
+    state = social.status(platform_key, configured)
+    label, icon, colour = _SOCIAL_BADGE[state]
+
+    name_col, status_col, button_col = st.columns([2, 3, 2])
+    name_col.markdown(f"**{plat.label}**")
+    status_col.markdown(f":{colour}[:{icon.strip(':')}: {label}]")
+
+    proc_key = f"_login_proc_{platform_key}"
+    running = st.session_state.get(proc_key)
+    open_now = running is not None and running.poll() is None
+
+    if open_now:
+        button_col.button("Browser open...", key=f"connect_{platform_key}",
+                          disabled=True, width="stretch")
+        status_col.caption("Sign in in the open window, then close it and "
+                           "press R to refresh this status.")
+    elif button_col.button(f"Connect {plat.label}", key=f"connect_{platform_key}",
+                           width="stretch", icon=":material/link:"):
+        # sys.executable is the venv Python already running Streamlit - more
+        # reliable than reconstructing the path. Fire-and-forget: a headed
+        # browser blocks for minutes, so it must not run on the script thread.
+        # The handle is kept so a second click cannot open a second browser
+        # onto the same profile and hit Chromium's profile lock.
+        try:
+            # Record the profile folder in .env now, so the hunter (which only
+            # uses a stored session when its dir is set) picks it up the moment
+            # the login finishes - closing the loop without a manual .env edit.
+            if not configured:
+                target_dir = social.profile_dir(platform_key)
+                envfile.set_values({plat.env_var: target_dir})
+            st.session_state[proc_key] = subprocess.Popen(
+                [sys.executable, str(config_module.ROOT / "tools" / "social_login.py"),
+                 platform_key])
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not open the browser: {type(exc).__name__}: {exc}",
+                     icon=":material/error:")
+
+    if state == social.UNKNOWN and not open_now:
+        st.caption(f"A {plat.label} profile exists but no live session cookie "
+                   "was found - sign in again if hunts hit a login wall.")
 
 
 # --------------------------------------------------------------------------

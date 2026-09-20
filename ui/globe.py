@@ -36,6 +36,20 @@ ARC_EDGE_HEX = "#00c8ff"
 CDN_GLOBE = "https://cdn.jsdelivr.net/npm/globe.gl"
 
 
+def filter_rows(rows: list[dict], sources: list[str],
+                lead_types: list[str]) -> list[dict]:
+    """Rows kept by the globe's source and sector filters.
+
+    An empty filter list means "all" for that dimension, so the default view is
+    the whole vault. Pure, so the filtering can be tested without a browser.
+    """
+    src = set(sources or [])
+    typ = set(lead_types or [])
+    return [r for r in rows
+            if (not src or (r.get("source") or "") in src)
+            and (not typ or (r.get("lead_type") or "") in typ)]
+
+
 def globe_payload(points: list[dict], selected_keys: set[str] | None = None,
                   normalise=None) -> dict:
     """The globe's data: points, arcs and the hub, as plain JSON-ready dicts.

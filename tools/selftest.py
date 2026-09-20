@@ -2249,6 +2249,138 @@ check("an empty pick captures nothing",
 check("a city no longer on the map is simply dropped",
       geo.seeds_for_cities(_ordered, ["Atlantis"]) == [])
 
+# ---------------------------------------------------------------------------
+print("\nsocial session state")
+import sqlite3 as _sqlite3  # noqa: E402
+from core import social  # noqa: E402
+
+
+def _make_cookie_db(root, platform_key, name="sessionid",
+                    host=".tiktok.com", offset_seconds=86400, value="x"):
+    """A throwaway Chromium-shaped cookie DB, so the check needs no browser."""
+    prof = Path(root) / f"{platform_key}-profile" / "Default" / "Network"
+    prof.mkdir(parents=True, exist_ok=True)
+    db = prof / "Cookies"
+    conn = _sqlite3.connect(db)
+    conn.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, "
+                 "encrypted_value BLOB, expires_utc INTEGER)")
+    if name is not None:
+        expires = int((time.time() + offset_seconds
+                       + social._CHROMIUM_EPOCH_OFFSET) * 1_000_000)
+        conn.execute("INSERT INTO cookies VALUES (?,?,?,?,?)",
+                     (host, name, value, None, expires))
+    conn.commit()
+    conn.close()
+    return str(Path(root) / f"{platform_key}-profile")
+
+
+_sroot = Path(tempfile.mkdtemp())
+_live = _make_cookie_db(_sroot, "tiktok")
+check("a live session cookie reads as CONNECTED",
+      social.status("tiktok", _live) == social.CONNECTED)
+
+# A folder exists before anyone signs in - the false green the folder-only
+# heuristic would have shown. It must be UNKNOWN, not CONNECTED.
+_empty = _sroot / "instagram-profile" / "Default" / "Network"
+_empty.mkdir(parents=True)
+check("a profile with no cookie DB is UNKNOWN, not connected",
+      social.status("instagram", str(_sroot / "instagram-profile")) == social.UNKNOWN)
+
+_expired = _make_cookie_db(Path(tempfile.mkdtemp()), "tiktok",
+                           offset_seconds=-100)
+check("an expired session cookie is UNKNOWN, not connected",
+      social.status("tiktok", _expired) == social.UNKNOWN)
+
+# A cookie for the wrong domain must not count as this platform's login.
+_wrong = _make_cookie_db(Path(tempfile.mkdtemp()), "instagram",
+                         name="sessionid", host=".example.com")
+check("a session cookie for another domain does not count",
+      social.status("instagram", _wrong) == social.UNKNOWN)
+
+# A session cookie with no value is not a login.
+_blank = _make_cookie_db(Path(tempfile.mkdtemp()), "tiktok", value="")
+check("a valueless session cookie does not count",
+      social.status("tiktok", _blank) == social.UNKNOWN)
+
+_no_root = Path(tempfile.mkdtemp())        # a ROOT with no profile folder at all
+_saved_root = social.ROOT
+social.ROOT = _no_root
+try:
+    check("no configured dir and no default folder is NOT_SET",
+          social.status("instagram", "") == social.NOT_SET)
+finally:
+    social.ROOT = _saved_root
+check("a configured dir that does not exist yet is UNKNOWN, not NOT_SET",
+      social.status("instagram", str(_sroot / "configured-but-missing"))
+      == social.UNKNOWN)
+check("TikTok also accepts its sid_tt cookie",
+      social.status("tiktok",
+                    _make_cookie_db(Path(tempfile.mkdtemp()), "tiktok",
+                                    name="sid_tt")) == social.CONNECTED)
+check("both platforms are known",
+      set(social.PLATFORMS) == {"tiktok", "instagram"})
+
+# ---------------------------------------------------------------------------
+print("\nglobe targeting filters")
+from ui import globe as _globe2  # noqa: E402
+
+_frows = [
+    {"source": "Apollo", "lead_type": "Agency", "location": "Rome"},
+    {"source": "Google Maps", "lead_type": "Agency", "location": "Milan"},
+    {"source": "Apollo", "lead_type": "Clipper", "location": "Berlin"},
+]
+check("no filter shows every row",
+      len(_globe2.filter_rows(_frows, [], [])) == 3)
+check("a source filter keeps only that source",
+      [r["location"] for r in _globe2.filter_rows(_frows, ["Apollo"], [])]
+      == ["Rome", "Berlin"])
+check("a sector filter keeps only that type",
+      [r["location"] for r in _globe2.filter_rows(_frows, [], ["Agency"])]
+      == ["Rome", "Milan"])
+check("source and sector filters intersect",
+      [r["location"] for r in _globe2.filter_rows(_frows, ["Apollo"], ["Agency"])]
+      == ["Rome"])
+check("a filter matching nothing yields an empty globe",
+      _globe2.filter_rows(_frows, ["Reddit"], []) == [])
+
+# ---------------------------------------------------------------------------
+print("\nvault concurrency (WAL holds under parallel writers)")
+# No concurrent-write bug exists - hunts return leads and the UI saves on one
+# thread - but WAL plus a busy timeout is what keeps a future concurrent writer
+# safe, so prove it rather than assume it.
+import threading as _threading  # noqa: E402
+
+_conc_db = Path(tempfile.gettempdir()) / "clipagent-concurrency.db"
+for _suffix in ("", "-wal", "-shm"):
+    Path(str(_conc_db) + _suffix).unlink(missing_ok=True)
+vault.init_db(_conc_db, migrate=False)
+
+_errors: list[str] = []
+
+
+def _writer(worker: int) -> None:
+    try:
+        batch = [{"name": f"w{worker}-{i}", "email": f"w{worker}i{i}@example.com",
+                  "source": "Apollo"} for i in range(20)]
+        vault.save_leads(f"conc-{worker}", vault.RAW, batch, path=_conc_db)
+    except Exception as exc:  # noqa: BLE001
+        _errors.append(f"{type(exc).__name__}: {exc}")
+
+
+_threads = [_threading.Thread(target=_writer, args=(w,)) for w in range(6)]
+for _t in _threads:
+    _t.start()
+for _t in _threads:
+    _t.join()
+
+check("six parallel writers all commit without a lock error",
+      _errors == [], str(_errors[:3]))
+_saved = vault.search_leads(path=_conc_db)
+check("every parallel write landed (no lost updates)",
+      len(_saved) == 120, len(_saved))
+for _suffix in ("", "-wal", "-shm"):
+    Path(str(_conc_db) + _suffix).unlink(missing_ok=True)
+
 for suffix in ("", "-wal", "-shm"):
     Path(str(TEST_DB) + suffix).unlink(missing_ok=True)
 print("\n" + ("ALL PASS" if not FAILURES else f"{len(FAILURES)} FAILED: {FAILURES}"))
