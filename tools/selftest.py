@@ -2107,6 +2107,141 @@ try:
 finally:
     apollo.configure(post=_real_post)
 
+# ---------------------------------------------------------------------------
+print("\nMX gate forgiveness")
+# The gate must save a lead on any doubt and drop only a definitive dead end.
+# These pin that policy so a future change to verify.py cannot quietly tighten
+# it and start binning good leads.
+from core import verify as _verify  # noqa: E402
+
+
+def _resolver(mx=None, a=None, nx=False, timeout=False):
+    """A resolver that answers however a test needs, for MX/A/AAAA."""
+    def resolve(domain, record, _timeout):
+        if timeout:
+            raise _verify.TransientFailure("resolver timed out")
+        if nx:
+            raise _verify.DefinitiveNegative("no such domain")
+        if record == "MX":
+            return list(mx or [])
+        return list(a or [])
+    return resolve
+
+
+_verify.configure(resolve=_resolver(mx=["10 mx.good."]))
+check("a domain with MX records is deliverable",
+      _verify.deliverable("x@has-mx.com"))
+
+_verify.configure(resolve=_resolver(mx=[], a=["203.0.113.5"]))
+check("no MX but an A record is deliverable (RFC 5321 implicit MX)",
+      _verify.deliverable("x@a-only.com"))
+
+_verify.configure(resolve=_resolver(timeout=True))
+check("a DNS timeout defaults to deliverable, never a drop",
+      _verify.deliverable("x@slow.com"))
+
+_verify.configure(resolve=_resolver(nx=True))
+check("an NXDOMAIN is the one case that drops",
+      not _verify.deliverable("x@nope.invalid"))
+
+_verify.configure(resolve=_resolver(mx=[], a=[]))
+check("a domain that resolves but has no MX and no address drops",
+      not _verify.deliverable("x@empty.com"))
+_verify.configure(resolve=_offline_mx)      # restore the suite-wide fixture
+
+# The Purify tab never runs a DNS check, so it can never drop a lead as
+# "invalid" for a mail-server reason - the split metric reflects that.
+_pr = purifier.purify([{"email": ""}, {"email": "not-an-email"},
+                       {"email": "real@example.com"}], drop_generic=False)
+check("purify counts a missing address and a malformed one separately",
+      _pr.no_email == 1 and _pr.invalid == 1 and _pr.kept == 1,
+      f"no_email={_pr.no_email} invalid={_pr.invalid} kept={_pr.kept}")
+
+# ---------------------------------------------------------------------------
+print("\n.env writer")
+from core import envfile  # noqa: E402
+
+_envdir = Path(tempfile.mkdtemp())
+_envp = _envdir / ".env"
+_envp.write_text("# NEXUS config\nFROM_NAME=Yahya\nDAILY_SEND_CAP=50\n"
+                 "APOLLO_API_KEY='old-key'\n", encoding="utf-8")
+
+envfile.set_values({"DAILY_SEND_CAP": "40", "APOLLO_API_KEY": "new-key",
+                    "NEXUS_PROXY": "http://p:1"}, path=_envp)
+_after = _envp.read_text(encoding="utf-8")
+check("an existing key is rewritten in place, not duplicated",
+      _after.count("DAILY_SEND_CAP=") == 1 and "DAILY_SEND_CAP='40'" in _after)
+check("an unrelated key and its comment are left untouched",
+      "# NEXUS config" in _after and "FROM_NAME=Yahya" in _after)
+check("a key already present is updated, not appended twice",
+      _after.count("APOLLO_API_KEY=") == 1 and "new-key" in _after)
+check("a new key is appended", "NEXUS_PROXY='http://p:1'" in _after)
+# The value is reloadable by the same parser the app uses.
+import os as _os  # noqa: E402
+from dotenv import dotenv_values  # noqa: E402
+_parsed = dotenv_values(_envp)
+check("the written file reloads through dotenv",
+      _parsed["DAILY_SEND_CAP"] == "40" and _parsed["APOLLO_API_KEY"] == "new-key")
+
+# A value that would corrupt the file is refused, and nothing is written.
+_before = _envp.read_text(encoding="utf-8")
+_raised = False
+try:
+    envfile.set_values({"FROM_NAME": "has'quote"}, path=_envp)
+except envfile.EnvWriteError:
+    _raised = True
+check("a value with a quote is refused before any write", _raised)
+check("the refused write left the file exactly as it was",
+      _envp.read_text(encoding="utf-8") == _before)
+
+# A blank .env is created rather than crashing.
+_fresh = _envdir / "fresh.env"
+envfile.set_values({"APOLLO_API_KEY": "k"}, path=_fresh)
+check("writing to a non-existent .env creates it",
+      _fresh.exists() and "APOLLO_API_KEY='k'" in _fresh.read_text(encoding="utf-8"))
+
+print("\nMAILBOXES serialisation")
+_mb = envfile.serialise_mailboxes([
+    {"host": "smtp.gmail.com", "port": 587, "email": "a@gmail.com",
+     "password": "pass with spaces", "from_name": "Ana"},
+    {"host": "smtp.zoho.eu", "port": 465, "email": "b@x.com",
+     "password": "pw:has:colons", "from_name": ""},
+])
+_reparsed = config_module.parse_accounts(_mb)
+check("every serialised mailbox parses back",
+      len(_reparsed) == 2, f"{len(_reparsed)} of 2")
+check("a password with spaces round-trips",
+      _reparsed[0].app_password == "pass with spaces")
+check("a password with colons keeps every colon",
+      _reparsed[1].app_password == "pw:has:colons")
+check("the from-name round-trips",
+      _reparsed[0].from_name == "Ana" and _reparsed[1].from_name == "")
+
+for _bad, _why in (
+    ({"host": "h", "port": 587, "email": "c@x.com", "password": "pw,comma"},
+     "comma"),
+    ({"host": "h", "port": 587, "email": "d@x.com", "password": "pw|pipe"},
+     "pipe"),
+    ({"host": "h", "port": 70000, "email": "e@x.com", "password": "pw"},
+     "port out of range"),
+    ({"host": "h", "port": 587, "email": "not-an-email", "password": "pw"},
+     "bad email"),
+    ({"host": "h", "port": 587, "email": "f@x.com", "password": ""},
+     "empty password"),
+):
+    _rej = False
+    try:
+        envfile.serialise_mailboxes([_bad])
+    except envfile.EnvWriteError:
+        _rej = True
+    check(f"a mailbox with a {_why} is refused", _rej)
+
+check("an empty rotation serialises to an empty string, not a crash",
+      envfile.serialise_mailboxes([]) == "")
+check("proxies serialise comma-separated",
+      envfile.serialise_proxies(["http://a:1", " ", "socks5://b:2"])
+      == "http://a:1,socks5://b:2")
+
 for suffix in ("", "-wal", "-shm"):
     Path(str(TEST_DB) + suffix).unlink(missing_ok=True)
 print("\n" + ("ALL PASS" if not FAILURES else f"{len(FAILURES)} FAILED: {FAILURES}"))

@@ -174,6 +174,27 @@ _CSS = f"""
       display: none !important;
   }}
 
+  /* ---- The radar: a framed global tracking pane ------------------------ */
+  /* deck.gl renders into a square canvas, so the rounded frame only holds if
+     the container clips it - border-radius alone leaves the corners poking
+     through. The height comes from st.pydeck_chart(height=600); here is only
+     the chrome. The Carto Dark Matter basemap is fetched over the network at
+     render time, so behind a blocking proxy the tiles grey out - the frame
+     and the data layers still draw. */
+  [data-testid="stDeckGlJsonChart"] {{
+      width: 100% !important;
+      border-radius: 12px;
+      border: 1px solid rgba(0, 243, 255, 0.30);
+      box-shadow: 0 0 24px rgba(0, 243, 255, 0.12),
+                  inset 0 0 40px rgba(0, 243, 255, 0.05);
+      overflow: hidden;
+      background: rgba(3, 8, 16, 0.85);
+  }}
+  [data-testid="stDeckGlJsonChart"] canvas,
+  [data-testid="stDeckGlJsonChart"] > div {{
+      border-radius: 12px;
+  }}
+
   /* ---- Background layer 2: the horizon sweep ---------------------------- */
   .stApp::after {{
       content: "";

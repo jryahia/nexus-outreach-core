@@ -20,8 +20,8 @@ import streamlit as st
 from streamlit_agraph import Config, Edge, Node, agraph
 
 from core import (
-    cannon, diagnostics, geo, hunter, killfeed, network, outpost, purifier,
-    templates, vault,
+    cannon, diagnostics, envfile, geo, hunter, killfeed, network, outpost,
+    purifier, templates, vault,
 )
 from core.config import ENV_PATH, load_config
 from ui.state import DONE, ERROR, RUNNING, STOPPED, get_job, reset_job, start_job, stop_job
@@ -465,10 +465,15 @@ def tab_purify() -> None:
             f"{res.kept} usable leads saved as {st.session_state['purify_batch']}",
             icon=":material/check_circle:",
         )
-        cols = st.columns(5)
+        # "No email" and "Malformed" are split apart on purpose. A scraped
+        # social profile usually has no address at all, which is not the same as
+        # a dropped bad one - conflating them made the drop count look alarming.
+        # No MX check runs here: deliverability is gated at send time, not here.
+        cols = st.columns(6)
         stats = [
             ("In", res.total_in), ("Kept", res.kept), ("Duplicates", res.duplicates),
-            ("Invalid", res.invalid + res.no_email), ("Role", res.generic),
+            ("No email", res.no_email), ("Malformed", res.invalid),
+            ("Role", res.generic),
         ]
         for col, (label, value) in zip(cols, stats):
             col.metric(label, value)
@@ -1021,7 +1026,7 @@ def radar_map(points: list[dict], unplaced: list[str]) -> None:
     # here calls st.rerun(), so a click costs exactly one pass.
     state = st.pydeck_chart(
         geo.deck(points, seeds, radius),
-        height=470,
+        height=600,
         selection_mode="multi-object",
         on_select="rerun",
         key="radar",
@@ -1290,6 +1295,130 @@ def tab_diagnostic() -> None:
 
 
 # --------------------------------------------------------------------------
+# Tab 7 - System Control (dynamic .env from the UI)
+# --------------------------------------------------------------------------
+def _mailbox_seed() -> pd.DataFrame:
+    """The current rotation as editor rows, passwords left blank on purpose.
+
+    A stored password is never round-tripped through the widget - the save
+    merges a blank cell against the mailbox already on file by email, so an
+    edit to the host alone can never overwrite the password with a mask.
+    """
+    rows = [{"host": s.host, "port": s.port, "email": s.email,
+             "password": "", "from_name": s.from_name}
+            for s in cfg.senders]
+    if not rows:
+        rows = [{"host": "smtp.gmail.com", "port": 587, "email": "",
+                 "password": "", "from_name": ""}]
+    return pd.DataFrame(rows, columns=["host", "port", "email", "password",
+                                       "from_name"])
+
+
+def _collect_mailboxes(edited: pd.DataFrame) -> list[dict]:
+    """Editor rows into mailbox dicts, filling blank passwords from the vault.
+
+    An existing mailbox keeps its stored password when the cell is left blank; a
+    new mailbox with no password is a user error, surfaced on save.
+    """
+    known = {s.email.strip().lower(): s.app_password for s in cfg.senders}
+    out: list[dict] = []
+    for _, row in edited.iterrows():
+        email = str(row.get("email") or "").strip().lower()
+        if not email:
+            continue                      # a blank spare row in the editor
+        password = str(row.get("password") or "").strip()
+        if not password:
+            password = known.get(email, "")
+        out.append({"host": str(row.get("host") or "").strip(),
+                    "port": row.get("port") or 0, "email": email,
+                    "password": password,
+                    "from_name": str(row.get("from_name") or "").strip()})
+    return out
+
+
+def tab_control() -> None:
+    st.subheader("System Control")
+    st.caption(
+        "Edit the live .env from here - no text editor, no restart. Saving "
+        "rewrites only the keys below and leaves the rest of the file untouched. "
+        "Everything stays on this machine."
+    )
+
+    section("Mailbox rotation")
+    st.caption(
+        "One row per sending account. Leave the password blank on an existing "
+        "mailbox to keep the stored one; enter it only to set or change it. "
+        "Add rows for rotation - the campaign cycles through them in order."
+    )
+    edited = st.data_editor(
+        _mailbox_seed(), num_rows="dynamic", width="stretch",
+        key="control_mailboxes",
+        column_config={
+            "host": st.column_config.TextColumn("SMTP host", required=False),
+            "port": st.column_config.NumberColumn("Port", min_value=1,
+                                                  max_value=65535, step=1),
+            "email": st.column_config.TextColumn("Email"),
+            "password": st.column_config.TextColumn("App password (blank = keep)"),
+            "from_name": st.column_config.TextColumn("From name"),
+        },
+    )
+
+    st.divider()
+    section("Apollo & proxies")
+    left, right = st.columns(2, gap="large")
+    with left:
+        apollo_key = st.text_input(
+            "Apollo API key", type="password",
+            placeholder="set" if cfg.has_apollo else "not set",
+            help="Leave blank to keep the current key. Clear it with the button "
+                 "below.",
+        )
+        clear_apollo = st.checkbox("Remove the stored Apollo key")
+    with right:
+        proxy_text = st.text_area(
+            "Proxy pool (one per line)",
+            value="\n".join(cfg.proxies),
+            help="Rotated across hunts. http://user:pass@host:port or "
+                 "socks5://host:port. Blank disables Ghost Protocol routing.",
+            height=120,
+        )
+
+    st.write("")
+    if st.button("SAVE TO .ENV", type="primary", width="stretch",
+                 icon=":material/save:"):
+        try:
+            updates: dict[str, str] = {}
+
+            mailboxes = _collect_mailboxes(edited)
+            # Serialise even an empty list, and write MAILBOXES="" explicitly:
+            # load_dotenv(override=True) only overwrites keys that are present,
+            # so an omitted key would leave a stale rotation live.
+            updates["MAILBOXES"] = envfile.serialise_mailboxes(mailboxes)
+
+            updates["NEXUS_PROXY"] = envfile.serialise_proxies(
+                proxy_text.splitlines())
+
+            if clear_apollo:
+                updates["APOLLO_API_KEY"] = ""
+            elif apollo_key.strip():
+                updates["APOLLO_API_KEY"] = apollo_key.strip()
+
+            envfile.set_values(updates)
+            st.success(
+                f"Saved. {len(mailboxes)} mailbox(es) in rotation.",
+                icon=":material/check_circle:",
+            )
+            st.rerun()
+        except envfile.EnvWriteError as exc:
+            st.error(f"Not saved: {exc}", icon=":material/error:")
+        except Exception as exc:
+            st.error(f"{type(exc).__name__}: {exc}", icon=":material/error:")
+
+    st.divider()
+    current_settings()
+
+
+# --------------------------------------------------------------------------
 # The badge reports the one fact that decides whether this is a live console
 # or a rehearsal: whether a mailbox is actually configured. Always-green would
 # be an ornament.
@@ -1311,9 +1440,9 @@ header("NEXUS: Outreach Core",
        "Acquire targets, purify the list, run the outreach. Local only.")
 status_strip()
 
-t1, t2, t3, t4, t5, t6 = st.tabs(
+t1, t2, t3, t4, t5, t6, t7 = st.tabs(
     ["Hunt", "Purify", "Campaign", "Analytics & Logs", "Network & Radar",
-     "System Diagnostic & Scan"]
+     "System Diagnostic & Scan", "System Control"]
 )
 with t1:
     tab_hunt()
@@ -1327,3 +1456,5 @@ with t5:
     tab_network()
 with t6:
     tab_diagnostic()
+with t7:
+    tab_control()
