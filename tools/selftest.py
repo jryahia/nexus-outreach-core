@@ -1400,67 +1400,6 @@ check("a stale index is ignored rather than raising",
 check("seeds are never duplicated in the capture",
       geo.capture_zone(_zone_pts, [0, 0, 1], 0) == [0, 1])
 
-_ring = geo.zone_polygon(_zone_pts, [0], 400)
-check("one polygon ring per seed", len(_ring) == 1)
-check("the ring closes on itself",
-      _ring[0]["polygon"][0] == _ring[0]["polygon"][-1])
-check("no ring without a radius", geo.zone_polygon(_zone_pts, [0], 0) == [])
-
-# Layer contract: st.pydeck_chart refuses to stay stateful unless every layer
-# carries an id, and the selection comes back keyed by the column layer's.
-_plain = geo.map_layers(_zone_pts)
-_ids = [getattr(layer, "id", None) for layer in _plain]
-check("every layer declares an id", all(_ids), str(_ids))
-check("the column layer is the pickable one",
-      [layer.id for layer in _plain if getattr(layer, "pickable", False)]
-      == [geo.LAYER_COLUMNS])
-check("no zone layer without a selection",
-      geo.LAYER_ZONE not in _ids)
-
-_locked = geo.map_layers(_zone_pts, [0], 400)
-_locked_ids = [layer.id for layer in _locked]
-check("a selection adds the zone and the halo",
-      geo.LAYER_ZONE in _locked_ids and geo.LAYER_HALO in _locked_ids,
-      str(_locked_ids))
-_cols = [layer for layer in _locked if layer.id == geo.LAYER_COLUMNS][0]
-# pydeck serialises the frame to a list of row dicts on the layer.
-_fills = [row["_fill"] for row in _cols.data]
-check("captured targets carry the locked colour",
-      _fills[0] == geo.LOCKED and _fills[1] == geo.LOCKED)
-check("quarantined targets drop to a tenth of their alpha",
-      _fills[2] == geo.DIMMED and geo.DIMMED[3] * 10 == geo.CYAN[3],
-      f"{geo.DIMMED} vs {geo.CYAN}")
-check("an empty map still returns no layers",
-      geo.map_layers([], [0], 400) == [])
-# The network arcs: a neon cyan sweep from the hub outward, drawn only when
-# there is a second city for the hub to reach.
-_arc = [layer for layer in _plain if layer.id == geo.LAYER_ARCS]
-check("two or more cities draw the routing arcs", len(_arc) == 1, len(_arc))
-check("arcs sweep neon cyan from the hub, fading outward",
-      _arc[0].get_source_color == geo.ARC_HUB
-      and _arc[0].get_target_color == geo.ARC_EDGE)
-check("a single city draws no arcs (nothing to connect to)",
-      geo.arc_rows(_zone_pts[:1]) == []
-      and geo.LAYER_ARCS not in [layer.id for layer in geo.map_layers(_zone_pts[:1])])
-# Free roam. The default view deck.gl builds already says controller: true,
-# which reads as enough and is not - rotation stays behind a modifier key, so
-# a 60-degree camera cannot actually be swung around. Every gesture is named.
-_view = json.loads(geo.deck(_zone_pts).to_json())["views"][0]
-check("the deck ships an explicit MapView", _view["@@type"] == "MapView")
-_ctrl = _view["controller"]
-check("the controller is a gesture map, not a bare true",
-      isinstance(_ctrl, dict), str(_ctrl))
-for _gesture in ("dragPan", "dragRotate", "scrollZoom", "doubleClickZoom",
-                 "touchRotate", "keyboard"):
-    check(f"{_gesture} is enabled", _ctrl.get(_gesture) is True)
-check("the globe keeps turning after a drag", _ctrl.get("inertia", 0) > 0)
-check("free roam survives a zone selection",
-      json.loads(geo.deck(_zone_pts, [0], 400).to_json())["views"][0]
-      ["controller"]["dragRotate"] is True)
-
-check("the tilt survives a selection",
-      geo.view_state(_zone_pts).pitch == 60
-      and geo.view_state(_zone_pts).bearing == 30)
 
 print("\njob dispatch")
 # Regression: start_job's second parameter used to be called `target`, which is
@@ -2266,7 +2205,7 @@ _gpts = [
 ]
 _pl = _globe.globe_payload(_gpts, {"milan"}, normalise=geo.normalise)
 check("every city becomes a globe point", len(_pl["points"]) == 3)
-check("pydeck lon is renamed to globe lng",
+check("the point longitude is renamed to globe lng",
       _pl["points"][0]["lng"] == 12.5 and "lon" not in _pl["points"][0])
 check("the busiest city is the hub", _pl["hub"] == "Rome")
 check("arcs sweep from the hub to every other city",

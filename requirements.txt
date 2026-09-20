@@ -11,10 +11,9 @@ scrapling[fetchers]==0.4.15
 streamlit==1.64.0
 pandas==2.3.3
 plotly==7.1.0
-# Force-directed network graph (vis.js) and the 3D radar map.
-# pydeck ships with streamlit; pinned here because the map depends on it.
+# Force-directed network graph (vis.js). The 3D globe is Globe.gl, loaded
+# from a CDN inside its own iframe, so it needs no Python package.
 streamlit-agraph==0.0.45
-pydeck==0.9.3
 
 # --- Data / config ---------------------------------------------------------
 python-dotenv==1.2.1
