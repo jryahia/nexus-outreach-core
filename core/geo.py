@@ -284,6 +284,19 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * EARTH_RADIUS_KM * asin(min(1.0, sqrt(h)))
 
 
+def seeds_for_cities(points: list[dict], names: list[str]) -> list[int]:
+    """Positions in ``points`` for the cities named in the target picker.
+
+    The picker stores city labels, not positions. Matching by label rather than
+    index is deliberate: city_points sorts by lead volume, so a fresh hunt
+    reorders the list, and an index captured before that hunt would silently
+    re-point at a different city. A label cannot drift.
+    """
+    wanted = {normalise(name) for name in (names or [])}
+    return [i for i, point in enumerate(points)
+            if normalise(point.get("city", "")) in wanted]
+
+
 def capture_zone(points: list[dict], seeds: list[int],
                  radius_km: float = 0.0) -> list[int]:
     """Indices captured by a zone seeded on ``seeds``.

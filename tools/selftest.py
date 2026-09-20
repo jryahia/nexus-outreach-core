@@ -2252,6 +2252,64 @@ check("proxies serialise comma-separated",
       envfile.serialise_proxies(["http://a:1", " ", "socks5://b:2"])
       == "http://a:1,socks5://b:2")
 
+# ---------------------------------------------------------------------------
+print("\nholographic globe")
+from ui import globe as _globe  # noqa: E402
+
+_gpts = [
+    {"city": "Rome", "lat": 41.9, "lon": 12.5, "leads": 10, "emails": 5,
+     "types": "Agency"},
+    {"city": "Milan", "lat": 45.5, "lon": 9.2, "leads": 4, "emails": 2,
+     "types": "Clipper"},
+    {"city": "Berlin", "lat": 52.5, "lon": 13.4, "leads": 2, "emails": 1,
+     "types": "Editor"},
+]
+_pl = _globe.globe_payload(_gpts, {"milan"}, normalise=geo.normalise)
+check("every city becomes a globe point", len(_pl["points"]) == 3)
+check("pydeck lon is renamed to globe lng",
+      _pl["points"][0]["lng"] == 12.5 and "lon" not in _pl["points"][0])
+check("the busiest city is the hub", _pl["hub"] == "Rome")
+check("arcs sweep from the hub to every other city",
+      len(_pl["arcs"]) == 2
+      and all(a["startLng"] == 12.5 for a in _pl["arcs"]))
+check("a picked city is flagged selected, others are not",
+      _pl["points"][1]["selected"] is True
+      and _pl["points"][0]["selected"] is False)
+check("a selected city marks its arc",
+      [a["city"] for a in _pl["arcs"] if a["selected"]] == ["Milan"])
+
+# One city cannot connect to anything - no arcs, no crash.
+_solo = _globe.globe_payload(_gpts[:1], normalise=geo.normalise)
+check("a single city draws points but no data streams",
+      len(_solo["points"]) == 1 and _solo["arcs"] == [])
+check("an empty vault yields an empty globe, not an error",
+      _globe.globe_payload([]) == {"points": [], "arcs": [], "hub": None})
+
+# The one non-cosmetic risk: a scraped city name carrying </script> must not be
+# able to break out of the data script tag.
+_hostile = _globe.globe_payload(
+    [{"city": "Rome</script><img src=x onerror=alert(1)>", "lat": 1, "lon": 2,
+      "leads": 1, "emails": 0, "types": ""}])
+_serialised = _globe.payload_json(_hostile)
+check("a hostile city name cannot terminate the script tag",
+      "</script" not in _serialised and "<\\/script" in _serialised)
+check("the escaped payload is still valid JSON",
+      json.loads(_serialised.replace("<\\/", "</"))["points"][0]["leads"] == 1)
+
+# Target picking: labels, not indices, so a re-sorted city list cannot drift.
+_ordered = [{"city": "Rome"}, {"city": "Milan"}, {"city": "Berlin"}]
+check("a picked city resolves to its position",
+      geo.seeds_for_cities(_ordered, ["Milan"]) == [1])
+check("picking is case- and space-insensitive",
+      geo.seeds_for_cities(_ordered, ["  milan "]) == [1])
+_resorted = [{"city": "Berlin"}, {"city": "Rome"}, {"city": "Milan"}]
+check("the same city still resolves after the list is re-sorted",
+      geo.seeds_for_cities(_resorted, ["Milan"]) == [2])
+check("an empty pick captures nothing",
+      geo.seeds_for_cities(_ordered, []) == [])
+check("a city no longer on the map is simply dropped",
+      geo.seeds_for_cities(_ordered, ["Atlantis"]) == [])
+
 for suffix in ("", "-wal", "-shm"):
     Path(str(TEST_DB) + suffix).unlink(missing_ok=True)
 print("\n" + ("ALL PASS" if not FAILURES else f"{len(FAILURES)} FAILED: {FAILURES}"))

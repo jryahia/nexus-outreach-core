@@ -24,6 +24,7 @@ from core import (
     purifier, templates, vault,
 )
 from core.config import ENV_PATH, load_config
+from ui import globe
 from ui.state import DONE, ERROR, RUNNING, STOPPED, get_job, reset_job, start_job, stop_job
 from ui.theme import (
     ACCENT,
@@ -818,14 +819,10 @@ def lead_intelligence() -> None:
     total_before_zone = len(rows)
     rows = rows_in_zone(rows, zone_keys)
     if zone_keys:
-        # No Release button here on purpose: a pydeck selection cannot be
-        # cleared from Python - Streamlit documents the state as read-only -
-        # so a button that claimed to release the zone would be overruled by
-        # the chart on the very next rerun. The map itself is the control.
         st.info(
             f"Zone filter active: {len(rows):,} of {total_before_zone:,} targets "
-            "inside the area acquired on the radar. Click empty space on the "
-            "map in Network & Radar to release it.",
+            "inside the acquired zone. Clear the target-city picker in "
+            "Network & Radar to release it.",
             icon=":material/my_location:",
         )
 
@@ -923,7 +920,7 @@ def tab_analytics() -> None:
 # --------------------------------------------------------------------------
 # Tab 5 - Network & Radar
 # --------------------------------------------------------------------------
-RADAR_KEY = "radar"              # the pydeck widget's own state key
+ZONE_PICK = "zone_pick"          # target cities chosen in the picker (labels)
 ZONE_RADIUS = "zone_radius_km"   # how far the zone reaches from each seed
 ZONE_CITIES = "zone_cities"      # normalised city keys currently captured
 ZONE_COUNT = "zone_count"        # leads inside the zone, for the HUD
@@ -945,29 +942,17 @@ def mapped_points(_signature: str) -> tuple[list[dict], list[dict], list[str]]:
 
 
 def resolve_zone() -> dict:
-    """Read the radar's selection and work out what it captures.
+    """Read the target picker's selection and work out what it captures.
 
-    Called once, before any tab renders. The chart's own widget state is the
-    single source of truth: st.pydeck_chart keeps it across reruns and refuses
-    to let it be set programmatically, so mirroring it into session state would
-    only create a second version that drifts.
-
-    Running before the tabs matters. The CRM grid lives in an earlier tab than
-    the radar, so resolving inside the radar would leave the grid a full rerun
-    behind the map.
+    Called once, before any tab renders. Running before the tabs matters: the
+    CRM grid lives in an earlier tab than the radar, so resolving inside the
+    radar would leave the grid a full rerun behind the globe.
     """
     counts = vault_stats(tick())
     signature = f"{counts['raw']}-{counts['clean']}"
     rows, points, unplaced = mapped_points(signature)
 
-    state = st.session_state.get(RADAR_KEY)
-    indices = []
-    if state is not None:
-        try:
-            indices = list(state["selection"]["indices"].get(geo.LAYER_COLUMNS, []))
-        except (KeyError, TypeError):
-            indices = []
-
+    indices = geo.seeds_for_cities(points, st.session_state.get(ZONE_PICK) or [])
     radius = int(st.session_state.get(ZONE_RADIUS, 0) or 0)
     captured = geo.capture_zone(points, indices, radius)
     keys = zone_city_keys(points, captured)
@@ -1003,45 +988,36 @@ def rows_in_zone(rows: list[dict], keys: set[str]) -> list[dict]:
 
 
 def radar_map(points: list[dict], unplaced: list[str]) -> None:
-    """Cyber-tracking view of where the leads are.
+    """The holographic target globe: cities as neon points, arcs from the hub.
 
-    Columns scale with lead volume, amber arcs route from the busiest city to
-    every other one, and the camera sits at a 60-degree tilt. The basemap is
-    Carto Dark Matter, which deck.gl serves without a Mapbox token.
+    Rendered by ui.globe in its own iframe - drag to rotate, scroll to dive.
+    The globe is display-only (an iframe cannot report a click back to Python),
+    so targets are acquired with the picker above it and passed back in as data
+    for the globe to light.
     """
     if not points:
         st.info("No leads with a recognised city yet.", icon=":material/public:")
         return
 
     zone = st.session_state.get("_zone") or {}
-    seeds = zone.get("seeds", [])
     captured = zone.get("captured", [])
-    radius = zone.get("radius", 0)
+    keys = zone.get("keys") or set()
 
-    # Layers, camera and basemap all live in core.geo, beside the coordinates
-    # that feed them. See geo.deck for the arc routing and the 60-degree tilt.
-    #
-    # on_select="rerun" makes the chart a widget: one rerun per selection
-    # change, which is not a loop. The map is NOT inside a fragment and nothing
-    # here calls st.rerun(), so a click costs exactly one pass.
-    state = st.pydeck_chart(
-        geo.deck(points, seeds, radius),
-        height=600,
-        selection_mode="multi-object",
-        on_select="rerun",
-        key="radar",
+    # The target picker. Its selection is read by resolve_zone at the top of the
+    # next rerun and scopes the CRM grid, the graph and the globe alike.
+    st.multiselect(
+        "Acquire target cities", options=[p["city"] for p in points],
+        key=ZONE_PICK,
+        help="Pick one or more cities to lock a zone. Widen the radius below to "
+             "pull in every city around them. The globe lights what is locked.",
     )
 
-    # The widget writes its own state; resolve_zone() reads it at the top of the
-    # next rerun. Nothing is written back here, so there is no second copy to
-    # drift and no rerun triggered from inside the render.
-    del state
+    globe.render_globe(points, keys, normalise=geo.normalise, height=720)
 
-    # Tells the HUD how many targets are inside the zone. Emitted from here so
-    # it lives and dies with the radar itself.
+    # Tells the HUD how many targets are inside the zone.
     zone_state(st.session_state.get(ZONE_COUNT))
 
-    if seeds:
+    if captured:
         locked = ", ".join(points[i]["city"] for i in captured[:6])
         more = f" +{len(captured) - 6} more" if len(captured) > 6 else ""
         total = sum(int(points[i]["leads"]) for i in captured)
@@ -1052,18 +1028,17 @@ def radar_map(points: list[dict], unplaced: list[str]) -> None:
         )
     else:
         st.caption(
-            "Click a column to acquire it. Ctrl-click or Cmd-click to add more. "
-            "Widen the zone radius to pull in every city around the ones you "
-            "picked. Click empty space to release."
+            "Pick a city above to acquire it, or several for a wider zone. "
+            "Raise the radius to pull in every city around the ones you picked."
         )
 
     if len(points) < 2:
-        # The network arcs sweep from the busiest city to the others, so a
+        # The data streams sweep from the busiest city to the others, so a
         # single city has nothing to connect to - say so rather than leave the
         # operator hunting for arcs that cannot exist.
         st.caption(
-            "Routing arcs appear once two or more cities are on the map. Hunt a "
-            "second city to draw the network."
+            "Data-stream arcs appear once two or more cities are on the globe. "
+            "Hunt a second city to draw the network."
         )
 
     if unplaced:

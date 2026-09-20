@@ -168,32 +168,30 @@ _CSS = f"""
 
   /* The runtime is mounted through a zero-size component iframe. Streamlit
      still emits a wrapper element for it, and an empty iframe in the flow
-     leaves a stray line box, so the wrapper is taken out of layout. */
-  [data-testid="stCustomComponentV1"],
-  iframe[title="streamlit_component_html"] {{
+     leaves a stray line box, so that wrapper is taken out of layout - scoped
+     to the zero-height iframe so the visible ones (the target globe) are not
+     also hidden. */
+  [data-testid="stCustomComponentV1"]:has(iframe[height="0"]) {{
+      display: none !important;
+  }}
+  iframe[title="streamlit_component_html"][height="0"] {{
       display: none !important;
   }}
 
-  /* ---- The radar: a framed global tracking pane ------------------------ */
-  /* deck.gl renders into a square canvas, so the rounded frame only holds if
-     the container clips it - border-radius alone leaves the corners poking
-     through. The height comes from st.pydeck_chart(height=600); here is only
-     the chrome. The Carto Dark Matter basemap is fetched over the network at
-     render time, so behind a blocking proxy the tiles grey out - the frame
-     and the data layers still draw. */
-  [data-testid="stDeckGlJsonChart"] {{
+  /* ---- The target globe: a framed holographic viewport ------------------ */
+  /* The globe is a visible component iframe; give its wrapper the same cyan
+     glass frame the flat radar used to carry. */
+  [data-testid="stCustomComponentV1"]:has(iframe[title="streamlit_component_html"]:not([height="0"])) {{
       width: 100% !important;
       border-radius: 12px;
       border: 1px solid rgba(0, 243, 255, 0.30);
-      box-shadow: 0 0 24px rgba(0, 243, 255, 0.12),
-                  inset 0 0 40px rgba(0, 243, 255, 0.05);
+      box-shadow: 0 0 28px rgba(0, 243, 255, 0.14),
+                  inset 0 0 48px rgba(0, 243, 255, 0.06);
       overflow: hidden;
-      background: rgba(3, 8, 16, 0.85);
+      background: radial-gradient(ellipse at center,
+                  rgba(0, 40, 70, 0.35), rgba(2, 8, 16, 0.92));
   }}
-  [data-testid="stDeckGlJsonChart"] canvas,
-  [data-testid="stDeckGlJsonChart"] > div {{
-      border-radius: 12px;
-  }}
+
 
   /* ---- Background layer 2: the horizon sweep ---------------------------- */
   .stApp::after {{
