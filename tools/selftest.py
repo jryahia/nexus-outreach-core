@@ -1432,6 +1432,16 @@ check("quarantined targets drop to a tenth of their alpha",
       f"{geo.DIMMED} vs {geo.CYAN}")
 check("an empty map still returns no layers",
       geo.map_layers([], [0], 400) == [])
+# The network arcs: a neon cyan sweep from the hub outward, drawn only when
+# there is a second city for the hub to reach.
+_arc = [layer for layer in _plain if layer.id == geo.LAYER_ARCS]
+check("two or more cities draw the routing arcs", len(_arc) == 1, len(_arc))
+check("arcs sweep neon cyan from the hub, fading outward",
+      _arc[0].get_source_color == geo.ARC_HUB
+      and _arc[0].get_target_color == geo.ARC_EDGE)
+check("a single city draws no arcs (nothing to connect to)",
+      geo.arc_rows(_zone_pts[:1]) == []
+      and geo.LAYER_ARCS not in [layer.id for layer in geo.map_layers(_zone_pts[:1])])
 # Free roam. The default view deck.gl builds already says controller: true,
 # which reads as enough and is not - rotation stays behind a modifier key, so
 # a 60-degree camera cannot actually be swung around. Every gesture is named.

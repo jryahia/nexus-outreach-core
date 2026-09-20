@@ -202,7 +202,11 @@ MAP_BEARING = 30
 
 CYAN = [0, 255, 255, 200]      # target columns
 CYAN_SOFT = [0, 243, 255, 55]  # ground glow under each column
-AMBER = [255, 170, 0, 160]     # routing arcs, at the hub end
+AMBER = [255, 170, 0, 160]     # locked-state routing arcs, at the hub end
+# Routing arcs read as a neon network: a brighter core at the hub fading to a
+# softer cyan at each city, so the eye follows the sweep outward from Rome.
+ARC_HUB = [80, 255, 255, 230]
+ARC_EDGE = [0, 200, 255, 120]
 
 # Acquired targets. Amber reads as "locked" against the cyan field, and the
 # halo gives the column a visible ring without a second draw call per frame.
@@ -408,8 +412,8 @@ def map_layers(points: list[dict], selected: list[int] | None = None,
                 data=pd.DataFrame(arcs),
                 get_source_position=["from_lon", "from_lat"],
                 get_target_position=["to_lon", "to_lat"],
-                get_source_color=AMBER if not quarantined else DIMMED,
-                get_target_color=CYAN if not quarantined else DIMMED,
+                get_source_color=ARC_HUB if not quarantined else DIMMED,
+                get_target_color=ARC_EDGE if not quarantined else DIMMED,
                 get_width=1.6,
                 get_height=0.45,
                 pickable=False,

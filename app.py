@@ -1057,6 +1057,15 @@ def radar_map(points: list[dict], unplaced: list[str]) -> None:
             "picked. Click empty space to release."
         )
 
+    if len(points) < 2:
+        # The network arcs sweep from the busiest city to the others, so a
+        # single city has nothing to connect to - say so rather than leave the
+        # operator hunting for arcs that cannot exist.
+        st.caption(
+            "Routing arcs appear once two or more cities are on the map. Hunt a "
+            "second city to draw the network."
+        )
+
     if unplaced:
         st.caption(
             f"{len(unplaced)} location(s) not on the map: {', '.join(unplaced[:6])}. "
@@ -1111,9 +1120,13 @@ def tab_network() -> None:
     d.metric("Types", len({(r.get('lead_type') or '').strip()
                            for r in scoped if (r.get('lead_type') or '').strip()}))
 
-    graph_col, map_col = st.columns([3, 4], gap="large")
+    # War-room stack: the intelligence network sits centered up top, and the
+    # radar owns the full width below it. The agraph canvas is a fixed 560px
+    # (Config formats width as f"{width}px", so a percentage collapses it), so
+    # the middle column is sized to seat that number rather than stretched.
+    _net_left, _net_mid, _net_right = st.columns([1, 3, 1])
 
-    with graph_col:
+    with _net_mid:
         section("Intelligence network")
         # The vis.js canvas fits its view the moment it mounts. Mounted inside
         # a tab that is not yet on screen it measures a zero-width parent and
@@ -1161,9 +1174,9 @@ def tab_network() -> None:
                 st.session_state["network_drawn"] = False
                 st.rerun()
 
-    with map_col:
-        section("Global radar")
-        radar_map(zone.get("points") or [], zone.get("unplaced") or [])
+    st.divider()
+    section("Global radar")
+    radar_map(zone.get("points") or [], zone.get("unplaced") or [])
 
 
 # --------------------------------------------------------------------------
@@ -1353,13 +1366,17 @@ def tab_control() -> None:
     edited = st.data_editor(
         _mailbox_seed(), num_rows="dynamic", width="stretch",
         key="control_mailboxes",
+        # Explicit widths so the columns line up like a server-config grid
+        # instead of auto-sizing to whatever each cell happens to hold.
         column_config={
-            "host": st.column_config.TextColumn("SMTP host", required=False),
+            "host": st.column_config.TextColumn("SMTP host", width="medium"),
             "port": st.column_config.NumberColumn("Port", min_value=1,
-                                                  max_value=65535, step=1),
-            "email": st.column_config.TextColumn("Email"),
-            "password": st.column_config.TextColumn("App password (blank = keep)"),
-            "from_name": st.column_config.TextColumn("From name"),
+                                                  max_value=65535, step=1,
+                                                  width="small"),
+            "email": st.column_config.TextColumn("Email", width="large"),
+            "password": st.column_config.TextColumn("App password (blank = keep)",
+                                                    width="medium"),
+            "from_name": st.column_config.TextColumn("From name", width="small"),
         },
     )
 
