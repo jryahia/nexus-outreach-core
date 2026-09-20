@@ -1,0 +1,16 @@
+#!/bin/sh
+# Strip AI-attribution trailers before a commit is written.
+#
+# This repository's history is authored solely by jryahia (Automia Labs). Some
+# tooling appends "Co-Authored-By: <AI>" or "Generated with ..." trailers; this
+# hook removes them so they can never reach the history, regardless of the tool
+# that wrote the message.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+msg_file="$1"
+grep -viE '^(Co-Authored-By:.*(Claude|Copilot|GPT|Gemini|AI)|.*Generated with .*Claude|.*Co-authored-by:.*(Claude|AI))' \
+    "$msg_file" > "$msg_file.tmp" 2>/dev/null || cp "$msg_file" "$msg_file.tmp"
+# Drop any trailing blank lines the removal left behind.
+sed -e :a -e '/^\n*$/{$d;N;ba}' "$msg_file.tmp" > "$msg_file"
+rm -f "$msg_file.tmp"
+exit 0

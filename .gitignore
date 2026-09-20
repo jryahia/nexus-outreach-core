@@ -7,10 +7,18 @@
 # Scraped leads, campaign history and the local database
 data/
 *.csv
+# SQLite vaults, anywhere - and their WAL/SHM sidecars
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 
-# Browser profiles captured by tools/tiktok_login.py
+# Browser profiles and session cookies (any *_PROFILE_DIR location)
 profiles/
+*-profile/
 *.session
+cookies.sqlite
 
 # Python
 __pycache__/

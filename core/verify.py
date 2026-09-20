@@ -79,8 +79,8 @@ def dns_resolver(domain: str, record: str, timeout: float) -> list[str]:
         answer = dns.resolver.resolve(domain, record, lifetime=timeout)
         return [str(item) for item in answer]
     except dns.resolver.NXDOMAIN as exc:
-        raise DefinitiveNegative(f"no such domain") from exc
-    except dns.resolver.NoAnswer as exc:
+        raise DefinitiveNegative("no such domain") from exc
+    except dns.resolver.NoAnswer:
         return []                       # the domain exists, this record does not
     except dns.resolver.NoNameservers as exc:
         raise TransientFailure("no nameservers answered") from exc

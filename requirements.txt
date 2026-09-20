@@ -18,6 +18,10 @@ streamlit-agraph==0.0.45
 # --- Data / config ---------------------------------------------------------
 python-dotenv==1.2.1
 email-validator==2.3.0
+# MX zero-bounce gate. Ships transitively with email-validator, pinned here
+# because core/verify.py imports dns.resolver directly and a transitive pin is
+# not a promise.
+dnspython==2.8.0
 
 # --- Live link -------------------------------------------------------------
 # The kill-feed WebSocket. Already present as a transitive dependency, pinned

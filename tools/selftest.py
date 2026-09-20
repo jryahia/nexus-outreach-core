@@ -1419,7 +1419,7 @@ for _kw in ("target", "keyword", "location", "fn", "key"):
         _sig.bind("hunt", lambda **kw: None, cfg=None, max_results=10,
                   skip_known=True, **{_kw: "x"})
         _ok = True
-    except TypeError as _exc:
+    except TypeError:
         _ok = False
     check(f"a scraper kwarg named {_kw!r} still dispatches", _ok)
 
@@ -2126,7 +2126,6 @@ check("a key already present is updated, not appended twice",
       _after.count("APOLLO_API_KEY=") == 1 and "new-key" in _after)
 check("a new key is appended", "NEXUS_PROXY='http://p:1'" in _after)
 # The value is reloadable by the same parser the app uses.
-import os as _os  # noqa: E402
 from dotenv import dotenv_values  # noqa: E402
 _parsed = dotenv_values(_envp)
 check("the written file reloads through dotenv",

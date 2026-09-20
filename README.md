@@ -169,14 +169,25 @@ under `prefers-reduced-motion`. Measured at a 10.1 ms median frame.
 .venv\Scripts\python.exe tools\selftest.py
 ```
 
-227 checks, fully offline — spintax, mailbox rotation, A/B assignment, the
-blacklist gate, dedup key scoping, WAL behaviour, migrations, geocoding, graph
-construction, job dispatch, and a dry-run campaign stopped mid-delay to prove
-cancellation. Exit code is non-zero if anything fails.
+494 checks, fully offline — spintax, mailbox rotation, A/B assignment, the
+blacklist gate, dedup key scoping, WAL behaviour under parallel writers,
+migrations, geocoding, the bulk hunter and its tag mining, Apollo ingestion,
+social session state, the globe payload, job dispatch, and a dry-run campaign
+stopped mid-delay to prove cancellation. Exit code is non-zero if anything
+fails.
 
 `tools/livetest.py` exercises the live scrapers against the network.
-`tools/tiktok_login.py` stores a browser profile for TikTok, which blocks
-logged-out requests.
+`tools/social_login.py` stores a browser profile for TikTok or Instagram,
+which block logged-out requests (also reachable from the Connect buttons in
+SYSTEM CONTROL).
+
+After cloning, enable the repository's git hooks once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This keeps the commit history clean and consistently authored.
 
 ---
 
